@@ -1,0 +1,16 @@
+torch>=2.7
+torchvision>=0.22
+diffusers>=0.35,<1
+accelerate>=1.7,<2
+safetensors>=0.5
+numpy>=1.26
+pandas>=2.2
+openpyxl>=3.1
+Pillow>=10.4
+PyYAML>=6.0
+scipy>=1.13
+scikit-image>=0.24
+tqdm>=4.66
+tensorboard>=2.17
+pytest>=8.2
+
