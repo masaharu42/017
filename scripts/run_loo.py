@@ -15,6 +15,7 @@ from typing import Any
 import pandas as pd
 
 from ebsd_diffusion.config import load_config, resolve_project_path
+from ebsd_diffusion.data import resolve_manifest_image_path
 from ebsd_diffusion.utils import RunProgressTracker, save_json
 
 
@@ -479,7 +480,6 @@ def validate_conditional_compositions(folds: list[int], compositions_path: Path)
 def load_held_out_images(folds: list[int], manifest_path: Path) -> dict[int, Path]:
     manifest = pd.read_csv(manifest_path)
     manifest["alloy_id"] = manifest["alloy_id"].astype(int)
-    root = manifest_path.parent
     result: dict[int, Path] = {}
     for fold in folds:
         rows = manifest.loc[manifest["alloy_id"] == fold]
@@ -487,9 +487,9 @@ def load_held_out_images(folds: list[int], manifest_path: Path) -> dict[int, Pat
             raise ValueError(
                 f"Expected exactly one manifest image for alloy {fold}, found {len(rows)}."
             )
-        image_path = Path(str(rows.iloc[0]["image_path"]))
-        if not image_path.is_absolute():
-            image_path = (root / image_path).resolve()
+        image_path = resolve_manifest_image_path(
+            manifest_path, rows.iloc[0]["image_path"]
+        )
         if not image_path.is_file():
             raise FileNotFoundError(f"Held-out image does not exist: {image_path}")
         result[fold] = image_path

@@ -11,6 +11,22 @@ from torch.utils.data import Dataset
 from torchvision.transforms import functional as TF
 
 
+def resolve_manifest_image_path(manifest_path: str | Path, value: str | Path) -> Path:
+    """Resolve image paths stored either relative to the manifest or project root."""
+    raw = Path(value)
+    if raw.is_absolute():
+        candidate = raw.resolve()
+        if candidate.is_file():
+            return candidate
+    manifest = Path(manifest_path).resolve()
+    candidates = [manifest.parent / raw, manifest.parent.parent / raw]
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate.is_file():
+            return candidate
+    return candidates[0].resolve()
+
+
 class EbsdPatchDataset(Dataset):
     def __init__(
         self,
@@ -44,12 +60,9 @@ class EbsdPatchDataset(Dataset):
         elif target == "diffusion":
             frame = frame.loc[frame["use_for_diffusion"].map(_as_bool)]
 
-        root = manifest_path.parent
         rows: list[dict[str, object]] = []
         for record in frame.to_dict("records"):
-            image_path = Path(str(record["image_path"]))
-            if not image_path.is_absolute():
-                image_path = (root / image_path).resolve()
+            image_path = resolve_manifest_image_path(manifest_path, record["image_path"])
             if not image_path.is_file():
                 raise FileNotFoundError(f"EBSD image does not exist: {image_path}")
             record["image_path"] = image_path
