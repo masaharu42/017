@@ -1,0 +1,18 @@
+{
+  "run_name": "EBSD VAE training",
+  "status": "completed",
+  "flow_stage": "completed",
+  "unit_name": "optimizer_step",
+  "completed_units": 30000,
+  "total_units": 30000,
+  "percent_complete": 100.0,
+  "started_at_local": "2026-07-22T22:40:58+08:00",
+  "last_update_local": "2026-07-23T00:19:50+08:00",
+  "elapsed_seconds": 5932.577,
+  "elapsed": "01:38:53",
+  "estimated_remaining_seconds": 0.0,
+  "estimated_remaining": "00:00:00",
+  "estimated_finish_local": "2026-07-23T00:19:50+08:00",
+  "average_seconds_per_unit": 0.197753,
+  "details": {}
+}

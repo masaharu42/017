@@ -1,0 +1,63 @@
+{
+  "global_step": 50000,
+  "latent_scaling": 1.0045350683601473,
+  "vae_dir": "D:\\01_EBSD成分条件扩散图像生成项目\\08_训练与生成结果\\05_留一验证\\fold_21\\models_strict\\vae\\final",
+  "vae_scale_factor": 4,
+  "patch_size": 192,
+  "exclude_alloy_id": 21,
+  "training_alloy_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    22
+  ],
+  "active_features": [
+    "Ni",
+    "Cr",
+    "Nb",
+    "Mo",
+    "Al",
+    "Ti"
+  ],
+  "dropped_features": {
+    "Fe": "closure_balance_removed",
+    "Ta": "nonzero_in_only_1_sample(s)",
+    "Co": "constant_or_near_constant"
+  },
+  "max_cuda_memory_gb": 0.6386966705322266,
+  "timing": {
+    "run_name": "EBSD composition-conditioned diffusion training",
+    "status": "completed",
+    "flow_stage": "completed",
+    "unit_name": "optimizer_step",
+    "completed_units": 50000,
+    "total_units": 50000,
+    "percent_complete": 100.0,
+    "started_at_local": "2026-07-23T00:19:59+08:00",
+    "last_update_local": "2026-07-23T01:40:01+08:00",
+    "elapsed_seconds": 4806.163,
+    "elapsed": "01:20:06",
+    "estimated_remaining_seconds": 0.0,
+    "estimated_remaining": "00:00:00",
+    "estimated_finish_local": "2026-07-23T01:40:01+08:00",
+    "average_seconds_per_unit": 0.096123,
+    "details": {}
+  }
+}

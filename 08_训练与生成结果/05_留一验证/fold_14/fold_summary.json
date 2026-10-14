@@ -1,0 +1,89 @@
+{
+  "status": "completed",
+  "created_at_local": "2026-07-22T19:38:51+08:00",
+  "held_out_alloy_id": 14,
+  "fold_position": 2,
+  "total_folds": 4,
+  "strict_vae_retraining": true,
+  "scientific_scope": "Strict image-and-condition holdout",
+  "training": {
+    "vae_max_steps": 30000,
+    "diffusion_max_steps": 50000,
+    "vae_final": "D:\\01_EBSD成分条件扩散图像生成项目\\08_训练与生成结果\\05_留一验证\\fold_14\\models_strict\\vae\\final",
+    "diffusion_final": "D:\\01_EBSD成分条件扩散图像生成项目\\08_训练与生成结果\\05_留一验证\\fold_14\\models_strict\\diffusion\\final"
+  },
+  "generation": {
+    "samples": 8,
+    "ddim_steps": 50,
+    "guidance_scale": 1.8,
+    "seed": 20260735,
+    "output_dir": "D:\\01_EBSD成分条件扩散图像生成项目\\08_训练与生成结果\\05_留一验证\\fold_14\\generated\\seed20260735_n8_steps50_cfg1p8",
+    "nearest_training_distance": 1.3738593561285273,
+    "is_extrapolation": false,
+    "range_violations": {}
+  },
+  "evaluation": {
+    "real_image": "D:\\01_EBSD成分条件扩散图像生成项目\\data\\原始EBSD导出数据\\14\\14-IPF + GB.bmp",
+    "report": "D:\\01_EBSD成分条件扩散图像生成项目\\08_训练与生成结果\\05_留一验证\\fold_14\\evaluation_seed20260735_n8_steps50_cfg1p8.json",
+    "metrics": {
+      "gb_fraction": {
+        "real_mean": 0.16463111111111112,
+        "generated_mean": 0.11492074074074074,
+        "relative_error": 0.3019500386948149
+      },
+      "grain_count": {
+        "real_mean": 286.0,
+        "generated_mean": 104.25,
+        "relative_error": 0.6354895104895105
+      },
+      "grain_area_median_px": {
+        "real_mean": 359.0,
+        "generated_mean": 851.75,
+        "relative_error": 1.3725626740947074
+      },
+      "grain_area_q25_px": {
+        "real_mean": 136.0,
+        "generated_mean": 165.40625,
+        "relative_error": 0.21622242647058823
+      },
+      "grain_area_q75_px": {
+        "real_mean": 1175.5,
+        "generated_mean": 2656.28125,
+        "relative_error": 1.259703317737133
+      },
+      "lab_mean_l": {
+        "real_mean": 66.35615539550781,
+        "generated_mean": 71.5784683227539,
+        "relative_error": 0.07870125832515659
+      },
+      "lab_mean_a": {
+        "real_mean": 23.011571884155273,
+        "generated_mean": 3.9256401509046555,
+        "relative_error": 0.829405823701784
+      },
+      "lab_mean_b": {
+        "real_mean": -5.1566290855407715,
+        "generated_mean": 5.220168795436621,
+        "relative_error": 2.01232194692343
+      },
+      "lab_std_l": {
+        "real_mean": 19.514617919921875,
+        "generated_mean": 20.176719665527344,
+        "relative_error": 0.03392850161465623
+      },
+      "lab_std_a": {
+        "real_mean": 59.69939041137695,
+        "generated_mean": 57.017133712768555,
+        "relative_error": 0.044929381692601654
+      },
+      "lab_std_b": {
+        "real_mean": 66.6185531616211,
+        "generated_mean": 67.67373991012573,
+        "relative_error": 0.015839232442420127
+      },
+      "two_point_rmse": 0.0020860641238373942,
+      "radial_power_rmse": 0.0011960888655836244,
+      "hue_jensen_shannon": 0.392559535613772
+    }
+  }
+}
