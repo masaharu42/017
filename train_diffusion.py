@@ -40,7 +40,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume-from", type=Path)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--lambda-gb", type=float)
+    parser.add_argument("--lambda-edge", type=float)
+    parser.add_argument("--structure-max-t", type=int)
     return parser.parse_args()
+
+
+def soft_structure_descriptors(images: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Differentiable proxies for black GB fraction and RGB edge density."""
+    rgb = (images + 1.0) * 0.5
+    max_rgb = rgb.amax(dim=1, keepdim=True)
+    gb = torch.sigmoid((0.22 - max_rgb) / 0.035).mean(dim=(1, 2, 3))
+    gray = rgb.mean(dim=1, keepdim=True)
+    kernel_x = gray.new_tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).view(1, 1, 3, 3)
+    kernel_y = kernel_x.transpose(2, 3)
+    grad_x = F.conv2d(gray, kernel_x, padding=1)
+    grad_y = F.conv2d(gray, kernel_y, padding=1)
+    edge = torch.sqrt(grad_x.square() + grad_y.square() + 1.0e-8).mean(dim=(1, 2, 3))
+    return gb, edge
 
 
 def main() -> None:
@@ -54,6 +71,15 @@ def main() -> None:
     train_cfg = config["train_diffusion"]
     if args.max_steps is not None:
         train_cfg["max_steps"] = args.max_steps
+    if args.lambda_gb is not None:
+        train_cfg["lambda_gb"] = args.lambda_gb
+    if args.lambda_edge is not None:
+        train_cfg["lambda_edge"] = args.lambda_edge
+    if args.structure_max_t is not None:
+        train_cfg["structure_max_t"] = args.structure_max_t
+    lambda_gb = float(train_cfg.get("lambda_gb", 0.0))
+    lambda_edge = float(train_cfg.get("lambda_edge", 0.0))
+    structure_max_t = int(train_cfg.get("structure_max_t", 0))
 
     output_dir = args.output_dir.resolve() if args.output_dir else resolve_project_path(config, train_cfg["output_dir"])
     if args.output_dir is None and args.exclude_alloy_id is not None:
@@ -231,6 +257,27 @@ def main() -> None:
                     raise ValueError(f"Unsupported prediction type: {noise_scheduler.config.prediction_type}")
 
                 loss = F.mse_loss(prediction.float(), target.float())
+                gb_loss = prediction.new_zeros(())
+                edge_loss = prediction.new_zeros(())
+                structure_fraction = float((timesteps <= structure_max_t).float().mean()) if structure_max_t >= 0 else 0.0
+                if (lambda_gb > 0.0 or lambda_edge > 0.0) and structure_max_t >= 0:
+                    gate = timesteps <= structure_max_t
+                    if bool(gate.any()):
+                        # x0 estimate is only decoded for the low-noise subset; VAE weights stay frozen.
+                        alpha = noise_scheduler.alphas_cumprod.to(latents.device)[timesteps]
+                        alpha = alpha.sqrt().view(-1, 1, 1, 1)
+                        sigma = (1.0 - noise_scheduler.alphas_cumprod.to(latents.device)[timesteps]).sqrt().view(-1, 1, 1, 1)
+                        x0 = (noisy_latents - sigma * prediction) / alpha
+                        decoded = vae.decode(x0[gate] / latent_scaling).sample
+                        pred_gb, pred_edge = soft_structure_descriptors(decoded)
+                        with torch.no_grad():
+                            target_gb, target_edge = soft_structure_descriptors(images[gate])
+                        if lambda_gb > 0.0:
+                            gb_loss = F.mse_loss(pred_gb, target_gb)
+                            loss = loss + lambda_gb * gb_loss
+                        if lambda_edge > 0.0:
+                            edge_loss = F.mse_loss(pred_edge, target_edge)
+                            loss = loss + lambda_edge * edge_loss
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
@@ -247,6 +294,10 @@ def main() -> None:
                 if global_step % int(train_cfg["log_every"]) == 0:
                     logs = {
                         "loss": float(loss.detach()),
+                        "noise_loss": float(F.mse_loss(prediction.float(), target.float()).detach()),
+                        "gb_loss": float(gb_loss.detach()),
+                        "edge_loss": float(edge_loss.detach()),
+                        "structure_fraction": structure_fraction,
                         "learning_rate": float(lr_scheduler.get_last_lr()[0]),
                         "latent_scaling": latent_scaling,
                         "condition_drop_fraction": float(drop_mask.float().mean()),
@@ -270,6 +321,10 @@ def main() -> None:
                             {
                                 "global_step": global_step,
                                 "loss": logs["loss"],
+                                "noise_loss": logs["noise_loss"],
+                                "gb_loss": logs["gb_loss"],
+                                "edge_loss": logs["edge_loss"],
+                                "structure_fraction": logs["structure_fraction"],
                                 "learning_rate": logs["learning_rate"],
                                 "latent_scaling": logs["latent_scaling"],
                                 "condition_drop_fraction": logs[
@@ -350,6 +405,11 @@ def main() -> None:
                 "training_alloy_ids": dataset.alloy_ids,
                 "active_features": conditioner.active_features,
                 "dropped_features": conditioner.state.dropped_features,
+                "structure_loss": {
+                    "lambda_gb": lambda_gb,
+                    "lambda_edge": lambda_edge,
+                    "structure_max_t": structure_max_t,
+                },
                 "max_cuda_memory_gb": (
                     float(torch.cuda.max_memory_allocated() / 1024**3)
                     if torch.cuda.is_available()
