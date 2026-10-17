@@ -82,8 +82,6 @@ def main() -> None:
     structure_max_t = int(train_cfg.get("structure_max_t", 0))
 
     output_dir = args.output_dir.resolve() if args.output_dir else resolve_project_path(config, train_cfg["output_dir"])
-    if args.output_dir is None and args.exclude_alloy_id is not None:
-        output_dir = output_dir.parent / f"diffusion_loo_{args.exclude_alloy_id:02d}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     accelerator = Accelerator(
