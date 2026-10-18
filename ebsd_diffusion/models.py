@@ -66,12 +66,27 @@ class ExponentialMovingAverage:
         self.shadow = [parameter.detach().clone() for parameter in parameters if parameter.requires_grad]
         self.backup: list[torch.Tensor] = []
 
+    @staticmethod
+    def _match_parameter_device(value: torch.Tensor, parameter: torch.Tensor) -> torch.Tensor:
+        """Move a restored EMA tensor to the parameter's device and dtype.
+
+        Accelerate can restore checkpoint state tensors on CPU even when the
+        model has already been prepared on CUDA.  Keeping the conversion here
+        makes resumed training safe for both old and new checkpoints.
+        """
+        if value.device != parameter.device or value.dtype != parameter.dtype:
+            return value.to(device=parameter.device, dtype=parameter.dtype)
+        return value
+
     @torch.no_grad()
     def step(self, parameters) -> None:
         trainable = [parameter for parameter in parameters if parameter.requires_grad]
         if len(trainable) != len(self.shadow):
             raise RuntimeError("EMA parameter structure changed during training.")
-        for shadow, parameter in zip(self.shadow, trainable, strict=True):
+        for index, (shadow, parameter) in enumerate(zip(self.shadow, trainable, strict=True)):
+            if shadow.device != parameter.device or shadow.dtype != parameter.dtype:
+                shadow = self._match_parameter_device(shadow, parameter)
+                self.shadow[index] = shadow
             shadow.lerp_(parameter.detach(), 1.0 - self.decay)
 
     @torch.no_grad()
@@ -82,12 +97,14 @@ class ExponentialMovingAverage:
     def copy_to(self, parameters) -> None:
         trainable = [parameter for parameter in parameters if parameter.requires_grad]
         for parameter, shadow in zip(trainable, self.shadow, strict=True):
+            shadow = self._match_parameter_device(shadow, parameter)
             parameter.copy_(shadow)
 
     @torch.no_grad()
     def restore(self, parameters) -> None:
         trainable = [parameter for parameter in parameters if parameter.requires_grad]
         for parameter, backup in zip(trainable, self.backup, strict=True):
+            backup = self._match_parameter_device(backup, parameter)
             parameter.copy_(backup)
         self.backup = []
 
