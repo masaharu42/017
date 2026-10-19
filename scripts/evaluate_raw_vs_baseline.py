@@ -71,12 +71,11 @@ def add_record(records: list[dict[str, object]], group: str, checkpoint: str, se
     metrics = descriptors(load_rgb(path))
     record: dict[str, object] = {"group": group, "checkpoint": checkpoint, "seed": seed, "path": str(path)}
     record.update(metrics)
-    record["descriptor_distance_to_real"] = float(
-        np.linalg.norm(
-            np.array([metrics[name] for name in reference], dtype=float)
-            - np.array([reference[name] for name in reference], dtype=float)
-        )
-    )
+    relative_errors = [
+        abs(metrics[name] - reference[name]) / max(abs(reference[name]), 1.0e-6)
+        for name in reference
+    ]
+    record["descriptor_distance_to_real"] = float(np.mean(relative_errors))
     records.append(record)
 
 
