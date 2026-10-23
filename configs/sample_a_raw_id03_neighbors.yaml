@@ -1,0 +1,19 @@
+name: cfg1.8_ddim50_step50000_id03_neighbors
+alloy_ids: [5, 7, 9]
+height: 256
+width: 256
+steps: 50
+guidance_scale: 1.8
+scheduler: ddim
+seeds: [20261012, 20261013, 20261014, 20261015, 20261016]
+gb_threshold: 0.18
+vae_dir: 01_基线留一验证_同一配置/00_基线模型/VAE模型/final
+compositions_csv: data/compositions.csv
+scheduler_dir: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000/scheduler
+output_dir: 04_统一对比图/阶段A_Fold03_A_raw_采样诊断/cfg1.8_ddim50_step50000_近邻合金
+raw_unet: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/留一验证_256_fold03_50000/fold_03/models_condition_only/diffusion/checkpoint-0050000/model.safetensors
+unet_config: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000/unet
+condition_encoder_dir: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000/condition_encoder
+condition_encoder_weights: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/留一验证_256_fold03_50000/fold_03/models_condition_only/diffusion/checkpoint-0050000/model_1.safetensors
+conditioner: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000/composition_conditioner.json
+run_metadata: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/留一验证_256_fold03_50000/fold_03/models_condition_only/diffusion/checkpoint-0050000/training_state.json

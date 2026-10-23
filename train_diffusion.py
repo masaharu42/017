@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import platform
 import time
 from pathlib import Path
 
@@ -9,6 +11,8 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+import accelerate
+import diffusers
 from accelerate import Accelerator
 from diffusers import AutoencoderKL, DDPMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
@@ -18,6 +22,13 @@ from tqdm.auto import tqdm
 from ebsd_diffusion.composition import CompositionConditioner, load_compositions
 from ebsd_diffusion.config import flatten_config_for_logging, load_config, resolve_project_path
 from ebsd_diffusion.data import EbsdPatchDataset, build_condition_mapping
+from ebsd_diffusion.losses import diffusion_mse_loss, validate_snr_gamma
+from ebsd_diffusion.training_control import (
+    load_frozen_conditioner,
+    load_initialized_models,
+    resolve_initialization,
+    tensor_fingerprint,
+)
 from ebsd_diffusion.models import (
     ContinuousConditionEmbedding,
     ExponentialMovingAverage,
@@ -64,11 +75,20 @@ def main() -> None:
     session_started_monotonic = time.perf_counter()
     args = parse_args()
     config = load_config(args.config)
-    seed_everything(int(config["seed"]))
     data_cfg = config["data"]
     composition_cfg = config["composition"]
     model_cfg = config["diffusion"]
     train_cfg = config["train_diffusion"]
+    controlled = bool(train_cfg.get("controlled_experiment", False))
+    if controlled and args.resume_from:
+        raise ValueError("This matched pilot uses fresh weights-only starts, not --resume-from.")
+    if bool(train_cfg.get("deterministic", False)):
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.benchmark = False
+    seed_everything(int(config["seed"]))
+    snr_gamma = train_cfg.get("snr_gamma")
+    validate_snr_gamma(snr_gamma, str(model_cfg["prediction_type"]))
     if args.max_steps is not None:
         train_cfg["max_steps"] = args.max_steps
     if args.lambda_gb is not None:
@@ -80,8 +100,13 @@ def main() -> None:
     lambda_gb = float(train_cfg.get("lambda_gb", 0.0))
     lambda_edge = float(train_cfg.get("lambda_edge", 0.0))
     structure_max_t = int(train_cfg.get("structure_max_t", 0))
+    if controlled and (lambda_gb != 0.0 or lambda_edge != 0.0):
+        raise ValueError("The matched Min-SNR pilot requires both structure loss weights to be zero.")
+    initialization, initialization_report = resolve_initialization(config)
 
     output_dir = args.output_dir.resolve() if args.output_dir else resolve_project_path(config, train_cfg["output_dir"])
+    if controlled and output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"Refusing to overwrite a non-empty pilot directory: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     accelerator = Accelerator(
@@ -90,6 +115,8 @@ def main() -> None:
         log_with="tensorboard",
         project_dir=output_dir / "logs",
     )
+    if controlled and accelerator.num_processes != 1:
+        raise ValueError("The matched pilot currently requires one process/GPU per arm.")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     if accelerator.is_main_process:
@@ -106,14 +133,17 @@ def main() -> None:
         train_ids.discard(int(args.exclude_alloy_id))
 
     compositions = load_compositions(resolve_project_path(config, data_cfg["compositions"]))
-    conditioner = CompositionConditioner.fit(
-        compositions,
-        candidate_features=composition_cfg["candidate_features"],
-        alloy_ids=train_ids,
-        closure_drop_feature=composition_cfg.get("closure_drop_feature"),
-        min_nonzero_samples=int(composition_cfg["min_nonzero_samples"]),
-        min_standard_deviation=float(composition_cfg["min_standard_deviation"]),
-    )
+    if initialization:
+        conditioner = load_frozen_conditioner(initialization, train_ids, compositions)
+    else:
+        conditioner = CompositionConditioner.fit(
+            compositions,
+            candidate_features=composition_cfg["candidate_features"],
+            alloy_ids=train_ids,
+            closure_drop_feature=composition_cfg.get("closure_drop_feature"),
+            min_nonzero_samples=int(composition_cfg["min_nonzero_samples"]),
+            min_standard_deviation=float(composition_cfg["min_standard_deviation"]),
+        )
     condition_mapping = build_condition_mapping(compositions, conditioner, train_ids)
 
     dataset = EbsdPatchDataset(
@@ -144,20 +174,29 @@ def main() -> None:
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
     latent_size = int(data_cfg["patch_size"]) // vae_scale_factor
 
-    unet = build_unet(model_cfg, int(vae.config.latent_channels), latent_size)
+    if initialization:
+        unet, condition_encoder, noise_scheduler = load_initialized_models(
+            initialization, model_cfg, conditioner.dimension
+        )
+        if int(unet.config.in_channels) != int(vae.config.latent_channels):
+            raise ValueError("Source U-Net and VAE latent channels differ.")
+        if int(unet.config.sample_size) != latent_size:
+            raise ValueError("Source U-Net sample_size differs from the configured training patch.")
+    else:
+        unet = build_unet(model_cfg, int(vae.config.latent_channels), latent_size)
+        condition_encoder = ContinuousConditionEmbedding(
+            input_dim=conditioner.dimension,
+            hidden_dim=int(model_cfg["condition_hidden_dim"]),
+            output_dim=unet_condition_dimension(unet),
+        )
+        noise_scheduler = DDPMScheduler(
+            num_train_timesteps=int(model_cfg["num_train_timesteps"]),
+            beta_schedule=str(model_cfg["beta_schedule"]),
+            prediction_type=str(model_cfg["prediction_type"]),
+            clip_sample=False,
+        )
     if bool(train_cfg.get("gradient_checkpointing", False)):
         unet.enable_gradient_checkpointing()
-    condition_encoder = ContinuousConditionEmbedding(
-        input_dim=conditioner.dimension,
-        hidden_dim=int(model_cfg["condition_hidden_dim"]),
-        output_dim=unet_condition_dimension(unet),
-    )
-    noise_scheduler = DDPMScheduler(
-        num_train_timesteps=int(model_cfg["num_train_timesteps"]),
-        beta_schedule=str(model_cfg["beta_schedule"]),
-        prediction_type=str(model_cfg["prediction_type"]),
-        clip_sample=False,
-    )
 
     optimizer = torch.optim.AdamW(
         list(unet.parameters()) + list(condition_encoder.parameters()),
@@ -177,7 +216,10 @@ def main() -> None:
     )
     accelerator.register_for_checkpointing(ema)
 
-    latent_scaling = estimate_latent_scaling(vae, loader, accelerator.device, max_batches=16)
+    latent_scaling = (
+        initialization_report["latent_scaling"] if initialization_report
+        else estimate_latent_scaling(vae, loader, accelerator.device, max_batches=16)
+    )
     global_step = 0
     previous_elapsed_seconds = 0.0
     if args.resume_from:
@@ -188,6 +230,26 @@ def main() -> None:
             global_step = int(state["global_step"])
             latent_scaling = float(state["latent_scaling"])
             previous_elapsed_seconds = float(state.get("elapsed_seconds", 0.0))
+
+    if controlled and int(train_cfg["gradient_accumulation_steps"]) != 1:
+        raise ValueError("The matched pilot records one batch per optimizer step; accumulation must be 1.")
+    if accelerator.is_main_process and controlled:
+        save_json({
+            "config": config,
+            "initialization": initialization_report,
+            "snr_gamma": snr_gamma,
+            "step_unit": "additional_optimizer_steps",
+            "optimizer_state_loaded": False,
+            "torch": torch.__version__,
+            "python": platform.python_version(),
+            "accelerate": accelerate.__version__,
+            "diffusers": diffusers.__version__,
+            "cuda": torch.version.cuda,
+            "device": str(accelerator.device),
+            "gpu_name": torch.cuda.get_device_name(accelerator.device) if accelerator.device.type == "cuda" else None,
+            "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+            "world_size": accelerator.num_processes,
+        }, output_dir / "initialization_metadata.json")
 
     tracker = None
     if accelerator.is_local_main_process:
@@ -241,6 +303,15 @@ def main() -> None:
                     model_cfg["condition_dropout"]
                 )
                 class_embedding = condition_encoder(vicinal_condition, drop_mask=drop_mask)
+                if controlled and (global_step < 5 or (global_step + 1) % int(train_cfg["log_every"]) == 0):
+                    append_csv_row(output_dir / "input_fingerprints.csv", {
+                        "additional_step": global_step + 1,
+                        "sha256": tensor_fingerprint(
+                            images=images, conditions=conditions, latents=latents,
+                            noise=noise, timesteps=timesteps,
+                            vicinal_condition=vicinal_condition, drop_mask=drop_mask,
+                        ),
+                    })
                 prediction = unet(
                     noisy_latents,
                     timesteps,
@@ -254,17 +325,21 @@ def main() -> None:
                 else:
                     raise ValueError(f"Unsupported prediction type: {noise_scheduler.config.prediction_type}")
 
-                loss = F.mse_loss(prediction.float(), target.float())
+                loss = diffusion_mse_loss(
+                    prediction, target, timesteps, noise_scheduler.alphas_cumprod,
+                    snr_gamma=snr_gamma,
+                    prediction_type=noise_scheduler.config.prediction_type,
+                )
                 gb_loss = prediction.new_zeros(())
                 edge_loss = prediction.new_zeros(())
                 structure_fraction = float((timesteps <= structure_max_t).float().mean()) if structure_max_t >= 0 else 0.0
                 if (lambda_gb > 0.0 or lambda_edge > 0.0) and structure_max_t >= 0:
                     gate = timesteps <= structure_max_t
                     if bool(gate.any()):
-                        # x0 estimate is only decoded for the low-noise subset; VAE weights stay frozen.
-                        alpha = noise_scheduler.alphas_cumprod.to(latents.device)[timesteps]
-                        alpha = alpha.sqrt().view(-1, 1, 1, 1)
-                        sigma = (1.0 - noise_scheduler.alphas_cumprod.to(latents.device)[timesteps]).sqrt().view(-1, 1, 1, 1)
+                        # Preserve the existing low-noise structure-loss path for non-pilot runs.
+                        alpha_bar = noise_scheduler.alphas_cumprod.to(latents.device)[timesteps]
+                        alpha = alpha_bar.sqrt().view(-1, 1, 1, 1)
+                        sigma = (1.0 - alpha_bar).sqrt().view(-1, 1, 1, 1)
                         x0 = (noisy_latents - sigma * prediction) / alpha
                         decoded = vae.decode(x0[gate] / latent_scaling).sample
                         pred_gb, pred_edge = soft_structure_descriptors(decoded)
@@ -276,16 +351,22 @@ def main() -> None:
                         if lambda_edge > 0.0:
                             edge_loss = F.mse_loss(pred_edge, target_edge)
                             loss = loss + lambda_edge * edge_loss
+                if controlled and not torch.isfinite(loss).item():
+                    raise RuntimeError("Non-finite pilot loss; stopping instead of exporting invalid weights.")
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(
+                    gradient_norm = accelerator.clip_grad_norm_(
                         list(unet.parameters()) + list(condition_encoder.parameters()), 1.0
                     )
+                    if controlled and not torch.isfinite(gradient_norm).item():
+                        raise RuntimeError("Non-finite pilot gradients; review both arms before continuing.")
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
 
             if accelerator.sync_gradients:
+                if controlled and accelerator.optimizer_step_was_skipped:
+                    raise RuntimeError("AMP skipped a pilot update. Stop and review both arms; do not compare unequal updates.")
                 global_step += 1
                 ema.step(accelerator.unwrap_model(unet).parameters())
                 progress.update(1)
@@ -300,6 +381,10 @@ def main() -> None:
                         "latent_scaling": latent_scaling,
                         "condition_drop_fraction": float(drop_mask.float().mean()),
                     }
+                    if controlled or snr_gamma is not None:
+                        logs["unweighted_mse"] = float(
+                            (prediction.detach().float() - target.float()).square().mean()
+                        )
                     timing = tracker.update(
                         global_step,
                         details={
@@ -323,6 +408,7 @@ def main() -> None:
                                 "gb_loss": logs["gb_loss"],
                                 "edge_loss": logs["edge_loss"],
                                 "structure_fraction": logs["structure_fraction"],
+                                **({"unweighted_mse": logs["unweighted_mse"]} if "unweighted_mse" in logs else {}),
                                 "learning_rate": logs["learning_rate"],
                                 "latent_scaling": logs["latent_scaling"],
                                 "condition_drop_fraction": logs[
@@ -364,6 +450,8 @@ def main() -> None:
                             {
                                 "global_step": global_step,
                                 "latent_scaling": latent_scaling,
+                                "initialization": initialization_report,
+                                "snr_gamma": snr_gamma,
                                 "elapsed_seconds": (
                                     tracker.elapsed_seconds if tracker is not None else 0.0
                                 ),
@@ -384,6 +472,8 @@ def main() -> None:
             tracker.set_stage("saving_final_diffusion_model", global_step)
         raw_unet = accelerator.unwrap_model(unet)
         raw_condition_encoder = accelerator.unwrap_model(condition_encoder)
+        if bool(train_cfg.get("export_raw", False)):
+            raw_unet.save_pretrained(final_dir / "unet_raw", safe_serialization=True)
         ema.store(raw_unet.parameters())
         ema.copy_to(raw_unet.parameters())
         raw_unet.save_pretrained(final_dir / "unet", safe_serialization=True)
@@ -395,6 +485,14 @@ def main() -> None:
         save_json(
             {
                 "global_step": global_step,
+                "source_global_step": initialization_report["source_global_step"] if initialization_report else 0,
+                "effective_total_step": global_step + (initialization_report["source_global_step"] if initialization_report else 0),
+                "initialization": initialization_report,
+                "snr_gamma": snr_gamma,
+                "unet_weight_types": {
+                    "unet": "ema_unet_with_raw_condition_encoder",
+                    **({"unet_raw": "raw"} if train_cfg.get("export_raw") else {}),
+                },
                 "latent_scaling": latent_scaling,
                 "vae_dir": str(Path(vae_dir).resolve()),
                 "vae_scale_factor": vae_scale_factor,

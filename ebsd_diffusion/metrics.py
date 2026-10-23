@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from scipy import ndimage
 from scipy.spatial.distance import jensenshannon
 from skimage import color, measure, morphology
 
@@ -25,6 +26,7 @@ class ImageDescriptors:
     two_point: list[float]
     radial_power: list[float]
     hue_histogram: list[float]
+    edge_density: float = 0.0
 
 
 def describe_image(
@@ -77,6 +79,7 @@ def describe_image(
         two_point=radial_two_point(interior.astype(np.float32), radial_bins).tolist(),
         radial_power=radial_power_spectrum(boundary.astype(np.float32), radial_bins).tolist(),
         hue_histogram=hue_hist.tolist(),
+        edge_density=rgb_edge_density(rgb),
     )
 
 
@@ -96,6 +99,7 @@ def compare_descriptor_sets(real: list[ImageDescriptors], generated: list[ImageD
         "lab_std_l",
         "lab_std_a",
         "lab_std_b",
+        "edge_density",
     ]
     result: dict[str, object] = {"real_count": len(real), "generated_count": len(generated)}
     for field in scalar_fields:
@@ -122,6 +126,27 @@ def compare_descriptor_sets(real: list[ImageDescriptors], generated: list[ImageD
 
 def descriptors_as_dict(value: ImageDescriptors) -> dict:
     return asdict(value)
+
+
+def rgb_edge_density(rgb: np.ndarray) -> float:
+    """Mean Sobel magnitude of an RGB image stored in [0, 1].
+
+    The kernel matches ``ebsd_diffusion.models.sobel_magnitude``. It is a
+    cross-correlation, not divided by 8. The outer pixel is excluded so
+    zero padding does not dominate the mean.
+    """
+    array = np.asarray(rgb, dtype=np.float32)
+    if array.ndim != 3 or array.shape[2] < 3:
+        raise ValueError("Expected an RGB image with shape HxWx3.")
+    kernel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+    kernel_y = kernel_x.T
+    magnitudes = []
+    for channel in range(3):
+        gradient_x = ndimage.correlate(array[:, :, channel], kernel_x, mode="constant", cval=0.0)
+        gradient_y = ndimage.correlate(array[:, :, channel], kernel_y, mode="constant", cval=0.0)
+        magnitude = np.sqrt(gradient_x * gradient_x + gradient_y * gradient_y + 1.0e-8)
+        magnitudes.append(magnitude[1:-1, 1:-1])
+    return float(np.mean(magnitudes))
 
 
 def radial_two_point(field: np.ndarray, bins: int) -> np.ndarray:
