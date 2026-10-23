@@ -16,6 +16,7 @@ import diffusers
 from accelerate import Accelerator
 from diffusers import AutoencoderKL, DDPMScheduler
 from diffusers.optimization import get_cosine_schedule_with_warmup
+from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -54,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-gb", type=float)
     parser.add_argument("--lambda-edge", type=float)
     parser.add_argument("--structure-max-t", type=int)
+    parser.add_argument("--benchmark-steps", type=int, default=0,
+                        help="Disposable optimizer updates; writes timing only, never exports weights.")
+    parser.add_argument("--benchmark-warmup", type=int, default=3)
     return parser.parse_args()
 
 
@@ -79,6 +83,12 @@ def main() -> None:
     composition_cfg = config["composition"]
     model_cfg = config["diffusion"]
     train_cfg = config["train_diffusion"]
+    benchmark_steps = int(getattr(args, "benchmark_steps", 0))
+    benchmark_warmup = int(getattr(args, "benchmark_warmup", 3))
+    if benchmark_steps < 0 or (benchmark_steps and not 0 < benchmark_warmup < benchmark_steps):
+        raise ValueError("Benchmark requires 0 < warmup < steps.")
+    if benchmark_steps and args.resume_from:
+        raise ValueError("Benchmark must start fresh, not resume.")
     controlled = bool(train_cfg.get("controlled_experiment", False))
     if controlled and args.resume_from:
         raise ValueError("This matched pilot uses fresh weights-only starts, not --resume-from.")
@@ -87,6 +97,9 @@ def main() -> None:
         torch.use_deterministic_algorithms(True)
         torch.backends.cudnn.benchmark = False
     seed_everything(int(config["seed"]))
+    if "allow_tf32" in train_cfg:
+        torch.backends.cuda.matmul.allow_tf32 = bool(train_cfg["allow_tf32"])
+        torch.backends.cudnn.allow_tf32 = bool(train_cfg["allow_tf32"])
     snr_gamma = train_cfg.get("snr_gamma")
     validate_snr_gamma(snr_gamma, str(model_cfg["prediction_type"]))
     if args.max_steps is not None:
@@ -102,6 +115,7 @@ def main() -> None:
     structure_max_t = int(train_cfg.get("structure_max_t", 0))
     if controlled and (lambda_gb != 0.0 or lambda_edge != 0.0):
         raise ValueError("The matched Min-SNR pilot requires both structure loss weights to be zero.")
+    loop_steps = benchmark_steps or int(train_cfg["max_steps"])
     initialization, initialization_report = resolve_initialization(config)
 
     output_dir = args.output_dir.resolve() if args.output_dir else resolve_project_path(config, train_cfg["output_dir"])
@@ -119,6 +133,12 @@ def main() -> None:
         raise ValueError("The matched pilot currently requires one process/GPU per arm.")
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+    benchmark_memory = {}
+    if benchmark_steps and accelerator.device.type == "cuda":
+        free, total = torch.cuda.mem_get_info(accelerator.device)
+        benchmark_memory = {"initial_free_bytes": free, "total_bytes": total}
+        if train_cfg["mixed_precision"] == "bf16" and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("Selected GPU/runtime does not support BF16.")
     if accelerator.is_main_process:
         accelerator.init_trackers(
             "ebsd_latent_diffusion", config=flatten_config_for_logging(config)
@@ -167,6 +187,8 @@ def main() -> None:
         drop_last=True,
         persistent_workers=int(data_cfg["num_workers"]) > 0,
     )
+    if not len(loader):
+        raise ValueError("Dataset cannot supply a complete batch; reduce batch_size.")
 
     vae_dir = args.vae_dir or resolve_project_path(config, train_cfg["vae_dir"])
     vae = AutoencoderKL.from_pretrained(vae_dir)
@@ -198,10 +220,16 @@ def main() -> None:
     if bool(train_cfg.get("gradient_checkpointing", False)):
         unet.enable_gradient_checkpointing()
 
+    optimizer_options = {}
+    if train_cfg.get("fused_adamw", False):
+        if accelerator.device.type != "cuda":
+            raise ValueError("fused_adamw requires CUDA for this training protocol.")
+        optimizer_options["fused"] = True
     optimizer = torch.optim.AdamW(
         list(unet.parameters()) + list(condition_encoder.parameters()),
         lr=float(train_cfg["learning_rate"]),
         weight_decay=float(train_cfg["weight_decay"]),
+        **optimizer_options,
     )
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer,
@@ -272,20 +300,24 @@ def main() -> None:
         )
 
     progress = tqdm(
-        total=int(train_cfg["max_steps"]),
+        total=loop_steps,
         initial=global_step,
         disable=not accelerator.is_local_main_process,
         desc="Diffusion",
     )
     epoch = 0
-    while global_step < int(train_cfg["max_steps"]):
+    step_durations = []
+    benchmark_tick = None
+    while global_step < loop_steps:
         torch.manual_seed(int(config["seed"]) + epoch)
         for batch in loader:
             with accelerator.accumulate(unet, condition_encoder):
                 images = batch["pixel_values"]
                 conditions = batch["condition"]
                 with torch.no_grad():
-                    latents = vae.encode(images).latent_dist.sample() * latent_scaling
+                    latents = encode_training_latents(
+                        vae, images, int(train_cfg.get("vae_encode_batch_size", 0))
+                    ) * latent_scaling
 
                 noise = torch.randn_like(latents)
                 timesteps = torch.randint(
@@ -436,7 +468,7 @@ def main() -> None:
                         ),
                     )
 
-                if global_step % int(train_cfg["save_every"]) == 0:
+                if not benchmark_steps and global_step % int(train_cfg["save_every"]) == 0:
                     checkpoint = output_dir / f"checkpoint-{global_step:07d}"
                     if tracker is not None:
                         tracker.set_stage(
@@ -461,7 +493,38 @@ def main() -> None:
                     if tracker is not None:
                         tracker.set_stage("diffusion_training", global_step)
 
-                if global_step >= int(train_cfg["max_steps"]):
+                if benchmark_steps:
+                    if accelerator.device.type == "cuda":
+                        torch.cuda.synchronize(accelerator.device)
+                    now = time.perf_counter()
+                    if benchmark_tick is not None:
+                        step_durations.append(now - benchmark_tick)
+                    if global_step >= benchmark_warmup:
+                        benchmark_tick = now
+                    if global_step >= benchmark_steps:
+                        seconds = sum(step_durations)
+                        report = {
+                            "kind": "disposable_throughput_benchmark_not_scientific_training",
+                            "batch_size": int(train_cfg["batch_size"]),
+                            "warmup_steps": benchmark_warmup,
+                            "measured_steps": len(step_durations),
+                            "step_seconds": step_durations,
+                            "images_per_second": len(step_durations) * int(train_cfg["batch_size"]) / seconds,
+                            "seconds_per_step": seconds / len(step_durations),
+                            "device": str(accelerator.device),
+                            "gpu_name": torch.cuda.get_device_name(accelerator.device) if accelerator.device.type == "cuda" else None,
+                            "torch": torch.__version__, "cuda": torch.version.cuda,
+                            "mixed_precision": train_cfg["mixed_precision"],
+                            "peak_allocated_bytes": torch.cuda.max_memory_allocated(accelerator.device) if accelerator.device.type == "cuda" else 0,
+                            "peak_reserved_bytes": torch.cuda.max_memory_reserved(accelerator.device) if accelerator.device.type == "cuda" else 0,
+                            **benchmark_memory,
+                            "includes": "data loading, FP32 VAE, input audits, backward, optimizer, EMA, logging; excludes startup/checkpoint IO",
+                        }
+                        save_json(report, output_dir / "benchmark.json")
+                        progress.close()
+                        accelerator.end_training()
+                        return
+                if global_step >= loop_steps:
                     break
         epoch += 1
 
@@ -517,6 +580,17 @@ def main() -> None:
         )
     progress.close()
     accelerator.end_training()
+
+
+@torch.no_grad()
+def encode_training_latents(vae, images, microbatch: int = 0):
+    if microbatch <= 0 or microbatch >= len(images):
+        return vae.encode(images).latent_dist.sample()
+    # Encode in FP32 chunks, but draw posterior noise once to preserve RNG ordering.
+    parameters = torch.cat([
+        vae.encode(chunk).latent_dist.parameters for chunk in images.split(microbatch)
+    ])
+    return DiagonalGaussianDistribution(parameters).sample()
 
 
 @torch.no_grad()

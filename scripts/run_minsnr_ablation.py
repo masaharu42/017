@@ -73,6 +73,22 @@ def make_arm_configs(protocol: dict, root: Path) -> tuple[dict, dict[str, dict]]
         if key in base["data"]:
             base["data"][key] = str(absolute(root, base["data"][key]))
     settings = protocol["training"]
+    overrides = settings.get("performance", {})
+    allowed = {"batch_size", "mixed_precision", "gradient_checkpointing", "num_workers",
+               "vae_encode_batch_size", "allow_tf32", "fused_adamw"}
+    if set(overrides) - allowed:
+        raise ValueError(f"Unknown performance overrides: {sorted(set(overrides) - allowed)}")
+    for key, value in overrides.items():
+        if key in {"batch_size", "vae_encode_batch_size", "num_workers"}:
+            if isinstance(value, bool) or not isinstance(value, int) or value < (0 if key == "num_workers" else 1):
+                raise ValueError(f"Invalid performance {key}: {value}")
+        elif key == "mixed_precision":
+            if value not in {"no", "fp16", "bf16"}:
+                raise ValueError("mixed_precision must be no, fp16, or bf16.")
+        elif not isinstance(value, bool):
+            raise ValueError(f"performance {key} must be boolean.")
+        target = base["data"] if key == "num_workers" else base["train_diffusion"]
+        target[key] = value
     steps = int(settings["additional_steps"])
     warmup = int(settings["warmup_steps"])
     if steps <= 0 or not 0 <= warmup < steps:
@@ -136,6 +152,7 @@ def current_code_files(root: Path) -> list[Path]:
     files += [root / "scripts" / name for name in (
         "__init__.py", "run_minsnr_ablation.py", "sample_fold03_ab2c_256.py",
         "evaluate_ablation.py",
+        "tune_minsnr_throughput.py",
     )]
     return files
 

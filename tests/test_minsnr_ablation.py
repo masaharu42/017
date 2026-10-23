@@ -1,6 +1,8 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import numpy as np
 import pandas as pd
@@ -195,3 +197,94 @@ def test_two_arm_training_and_free_generation_smoke(tiny_protocol, monkeypatch):
             verify_pair(output, manifest)
     finally:
         torch.set_num_threads(previous_threads)
+
+
+def test_chunked_vae_preserves_posterior_draw_rng(tiny_protocol):
+    from diffusers import AutoencoderKL
+    from train_diffusion import encode_training_latents
+    _, protocol = tiny_protocol
+    source = Path(protocol["source_sampling_config"]).parent
+    vae = AutoencoderKL.from_pretrained(source / "vae").eval()
+    images = torch.randn(3, 3, 8, 8)
+    torch.manual_seed(42)
+    full = encode_training_latents(vae, images)
+    next_full = torch.randn(4)
+    torch.manual_seed(42)
+    chunked = encode_training_latents(vae, images, 1)
+    assert torch.allclose(full, chunked, atol=2e-6)
+    assert torch.equal(next_full, torch.randn(4))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda_bf16"])
+def test_disposable_benchmark_never_exports_or_checkpoints(tiny_protocol, monkeypatch, device):
+    from scripts.run_minsnr_ablation import PROJECT_ROOT
+    if device == "cuda_bf16" and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()):
+        pytest.skip("BF16 CUDA unavailable")
+    path, protocol = tiny_protocol
+    protocol["training"]["performance"] = {"vae_encode_batch_size": 1}
+    if device == "cuda_bf16":
+        protocol["training"]["performance"].update({
+            "mixed_precision": "bf16", "fused_adamw": True, "allow_tf32": True,
+            "gradient_checkpointing": False,
+        })
+    _, arms = make_arm_configs(protocol, PROJECT_ROOT)
+    monkeypatch.setenv("ACCELERATE_USE_CPU", "true" if device == "cpu" else "false")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1" if device == "cpu" else "0")
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    monkeypatch.setenv("MKL_NUM_THREADS", "1")
+    audits = []
+    for arm, config in arms.items():
+        arm_path = path.parent / f"benchmark_{arm}.yaml"
+        arm_path.write_text(yaml.safe_dump(config), "utf-8")
+        subprocess.run([sys.executable, str(PROJECT_ROOT / "train_diffusion.py"), "--config", str(arm_path),
+                        "--exclude-alloy-id", "3", "--benchmark-steps", "3", "--benchmark-warmup", "1"],
+                       cwd=PROJECT_ROOT, check=True, capture_output=True, text=True)
+        output = Path(config["train_diffusion"]["output_dir"])
+        report = json.loads((output / "benchmark.json").read_text("utf-8"))
+        assert report["measured_steps"] == 2
+        assert report["images_per_second"] > 0
+        assert not (output / "final").exists()
+        assert not list(output.glob("checkpoint-*"))
+        audits.append((output / "input_fingerprints.csv").read_bytes())
+    assert audits[0] == audits[1]
+
+
+@pytest.mark.parametrize("failure", [None, "CUDA out of memory", "missing checkpoint"])
+def test_tuner_orchestration_and_failures(tiny_protocol, monkeypatch, failure):
+    from types import SimpleNamespace
+    import scripts.tune_minsnr_throughput as tuner
+    path, protocol = tiny_protocol
+    protocol["require_cuda"] = True
+    path.write_text(yaml.safe_dump(protocol), "utf-8")
+    monkeypatch.setattr(tuner.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(tuner.torch.cuda, "is_bf16_supported", lambda: True)
+    output = path.parent / "benchmarks"
+
+    def fake_run(command, **kwargs):
+        config_path = Path(command[command.index("--config") + 1])
+        config = yaml.safe_load(config_path.read_text("utf-8"))
+        batch = config["train_diffusion"]["batch_size"]
+        if failure and batch == 2:
+            kwargs["stdout"].write(failure)
+            return SimpleNamespace(returncode=1)
+        folder = Path(config["train_diffusion"]["output_dir"])
+        folder.mkdir(parents=True)
+        (folder / "benchmark.json").write_text(json.dumps({
+            "images_per_second": batch * 10, "peak_reserved_bytes": 10 * batch,
+            "initial_free_bytes": 95, "total_bytes": 100,
+        }), "utf-8")
+        (folder / "input_fingerprints.csv").write_text("identical inputs", "utf-8")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(tuner.subprocess, "run", fake_run)
+    if failure == "missing checkpoint":
+        with pytest.raises(RuntimeError, match="not OOM"):
+            tuner.tune(path, output, [1, 2], samples=4)
+        return
+    result = tuner.tune(path, output, [1, 2], samples=4)
+    selected = yaml.safe_load(Path(result["selected_protocol"]).read_text("utf-8"))
+    expected = 1 if failure else 2
+    assert result["selected_batch_size"] == expected
+    assert selected["training"]["performance"]["batch_size"] * selected["training"]["additional_steps"] == 4
+    assert Path(selected["output_root"]) == Path(protocol["output_root"])
+    assert not Path(protocol["output_root"]).exists()
