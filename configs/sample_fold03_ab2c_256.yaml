@@ -1,0 +1,58 @@
+# 第一阶段主评价：已有 A20k + B2/C2，256x256，六组 raw/EMA。
+# 仅 Windows 执行；必须先通过预检和单种子 smoke，再运行正式五种子。
+# output_dir 为模板位置；执行副本直接放在 configs/ 下，并指定全新运行目录。
+# 新采样出表使用本脚本自带的 summary.csv / summary.json。
+# 路径基准与验收要求见 ../RUN_FOLD03_STAGE_A.md。
+fold: 3
+alloy_id: 3
+task: fold03_ab2c2_20k_256_raw_versus_ema
+evaluation_space: training_patch_256
+height: 256
+width: 256
+steps: 50
+guidance_scale: 1.8
+seeds: [20261012, 20261013, 20261014, 20261015, 20261016]
+count_per_seed: 1
+gb_threshold: 0.18
+vae_dir: 01_基线留一验证_同一配置/00_基线模型/VAE模型/final
+real_image: data/原始EBSD导出数据/3/3-IPF + GB.bmp
+compositions_csv: data/compositions.csv
+scheduler_dir: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000/scheduler
+output_dir: 04_统一对比图/阶段A_Fold03_AB2C2_256_raw_ema
+models:
+  - name: A
+    unet_config: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000/unet
+    raw_unet: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/留一验证_256_fold03_50000/fold_03/models_condition_only/diffusion/checkpoint-0020000/model.safetensors
+    raw_reference_unet: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000/unet/diffusion_pytorch_model.safetensors
+    ema_shadow: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/留一验证_256_fold03_50000/fold_03/models_condition_only/diffusion/checkpoint-0020000/custom_checkpoint_0.pkl
+    ema_export_unet:
+    condition_encoder_dir: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000/condition_encoder
+    condition_encoder_weights: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/留一验证_256_fold03_50000/fold_03/models_condition_only/diffusion/checkpoint-0020000/model_1.safetensors
+    conditioner: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000/composition_conditioner.json
+    run_metadata: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000/run_metadata.json
+    previously_sampled_weight: raw
+    previous_checkpoint: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000
+  - name: B2
+    unet_config: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_B2_gb_20000/final/unet
+    raw_unet: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_B2_gb_20000/checkpoint-0020000/model.safetensors
+    raw_reference_unet:
+    ema_shadow: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_B2_gb_20000/checkpoint-0020000/custom_checkpoint_0.pkl
+    ema_export_unet: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_B2_gb_20000/final/unet/diffusion_pytorch_model.safetensors
+    condition_encoder_dir: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_B2_gb_20000/final/condition_encoder
+    condition_encoder_weights: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_B2_gb_20000/checkpoint-0020000/model_1.safetensors
+    conditioner: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_B2_gb_20000/final/composition_conditioner.json
+    run_metadata: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_B2_gb_20000/final/run_metadata.json
+    previously_sampled_weight: ema_export
+    previous_checkpoint: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_B2_gb_20000/final
+  - name: C2
+    unet_config: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_C2_gb_edge_20000/final/unet
+    raw_unet: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_C2_gb_edge_20000/checkpoint-0020000/model.safetensors
+    raw_reference_unet:
+    ema_shadow: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_C2_gb_edge_20000/checkpoint-0020000/custom_checkpoint_0.pkl
+    ema_export_unet: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_C2_gb_edge_20000/final/unet/diffusion_pytorch_model.safetensors
+    condition_encoder_dir: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_C2_gb_edge_20000/final/condition_encoder
+    condition_encoder_weights: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_C2_gb_edge_20000/checkpoint-0020000/model_1.safetensors
+    conditioner: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_C2_gb_edge_20000/final/composition_conditioner.json
+    run_metadata: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_C2_gb_edge_20000/final/run_metadata.json
+    previously_sampled_weight: ema_export
+    previous_checkpoint: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/Fold03_C2_gb_edge_20000/final

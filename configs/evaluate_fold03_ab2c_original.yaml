@@ -1,0 +1,32 @@
+# LEGACY：历史三组原图尺度图片复评，每种子 5 张；不是新采样后处理。
+# 先归档，256 主表验收前不执行；不能读取新采样的六组 raw/EMA 产物。
+# 保留历史输入目录、方法名和计数，结果仅用于独立历史复评报告。
+# output_dir 为模板位置；获准执行时使用 configs/ 同层副本和全新运行目录。
+# 路径基准与执行条件见 ../RUN_FOLD03_STAGE_A.md。
+fold: 3
+evaluation_space: original_size
+seeds: [20261012, 20261013, 20261014, 20261015, 20261016]
+count_per_seed: 5
+gb_threshold: 0.18
+crop_size: [750, 450]
+montage_sample_index: 0
+
+real_images:
+  - data/原始EBSD导出数据/3/3-IPF + GB.bmp
+
+methods:
+  - name: A_baseline_20k
+    image_dir: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/同种子复采样_A_B2_C2_20k_原图尺寸/A_baseline_20k
+    glob: "seed*_n5/alloy_03_seed*_*.png"
+    checkpoint: 02_256空间匹配实验/服务器结果_256输入与原图尺寸采样/checkpoint_exports/fold_03/step_20000
+    vae_dir: 01_基线留一验证_同一配置/00_基线模型/VAE模型/final
+
+  - name: B2_gb_20k
+    image_dir: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/同种子复采样_A_B2_C2_20k_原图尺寸/B2_gb_20k
+    glob: "seed*_n5/alloy_03_seed*_*.png"
+
+  - name: C2_gb_edge_20k
+    image_dir: 03_结构loss消融/Fold03_全部结构loss实验/01_已有实验_训练结果/同种子复采样_A_B2_C2_20k_原图尺寸/C2_gb_edge_20k
+    glob: "seed*_n5/alloy_03_seed*_*.png"
+
+output_dir: 04_统一对比图/阶段A_Fold03_AB2C2_原图尺寸

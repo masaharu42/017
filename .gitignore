@@ -2,3 +2,12 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 08_训练与生成结果/*_运行/
+
+# macOS Finder metadata, at any directory depth.
+.DS_Store
+
+# Stage A generated images, metrics, montages, and run logs.
+/04_统一对比图/
+
+# Per-run copies stay directly in configs/ to preserve project-root resolution.
+/configs/*.local.yaml
