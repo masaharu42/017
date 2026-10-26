@@ -24,6 +24,7 @@ from ebsd_diffusion.composition import CompositionConditioner, load_compositions
 from ebsd_diffusion.config import flatten_config_for_logging, load_config, resolve_project_path
 from ebsd_diffusion.data import EbsdPatchDataset, build_condition_mapping
 from ebsd_diffusion.losses import diffusion_mse_loss, validate_snr_gamma
+from ebsd_diffusion.training_diagnostics import TrainingDiagnostics
 from ebsd_diffusion.training_control import (
     load_frozen_conditioner,
     load_initialized_models,
@@ -308,6 +309,7 @@ def main() -> None:
     epoch = 0
     step_durations = []
     benchmark_tick = None
+    diagnostics = TrainingDiagnostics(noise_scheduler.config.num_train_timesteps) if controlled and not benchmark_steps else None
     while global_step < loop_steps:
         torch.manual_seed(int(config["seed"]) + epoch)
         for batch in loader:
@@ -400,9 +402,18 @@ def main() -> None:
                 if controlled and accelerator.optimizer_step_was_skipped:
                     raise RuntimeError("AMP skipped a pilot update. Stop and review both arms; do not compare unequal updates.")
                 global_step += 1
+                if diagnostics is not None:
+                    diagnostics.record(prediction, target, timesteps, noise_scheduler.alphas_cumprod,
+                                       snr_gamma, gradient_norm.detach().item())
                 ema.step(accelerator.unwrap_model(unet).parameters())
                 progress.update(1)
-                if global_step % int(train_cfg["log_every"]) == 0:
+                if global_step % int(train_cfg["log_every"]) == 0 or (controlled and global_step == loop_steps):
+                    diagnostic_logs = {}
+                    if diagnostics is not None:
+                        diagnostic_logs, bin_rows = diagnostics.flush(global_step)
+                        for row in bin_rows:
+                            append_csv_row(output_dir / "timestep_metrics.csv", row)
+                        save_json(diagnostics.summary(), output_dir / "training_diagnostics.json")
                     logs = {
                         "loss": float(loss.detach()),
                         "noise_loss": float(F.mse_loss(prediction.float(), target.float()).detach()),
@@ -412,6 +423,7 @@ def main() -> None:
                         "learning_rate": float(lr_scheduler.get_last_lr()[0]),
                         "latent_scaling": latent_scaling,
                         "condition_drop_fraction": float(drop_mask.float().mean()),
+                        **diagnostic_logs,
                     }
                     if controlled or snr_gamma is not None:
                         logs["unweighted_mse"] = float(
@@ -441,6 +453,7 @@ def main() -> None:
                                 "edge_loss": logs["edge_loss"],
                                 "structure_fraction": logs["structure_fraction"],
                                 **({"unweighted_mse": logs["unweighted_mse"]} if "unweighted_mse" in logs else {}),
+                                **diagnostic_logs,
                                 "learning_rate": logs["learning_rate"],
                                 "latent_scaling": logs["latent_scaling"],
                                 "condition_drop_fraction": logs[

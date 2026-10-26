@@ -170,6 +170,8 @@ def sample_image(
     generate_width: int,
     crop_height: int,
     crop_width: int,
+    *,
+    sampling_audit: dict | None = None,
 ) -> Image.Image:
     device = condition.device
     dtype = condition.dtype
@@ -188,6 +190,14 @@ def sample_image(
         device=device,
         dtype=dtype,
     ) * scheduler.init_noise_sigma
+    if sampling_audit is not None:
+        from ebsd_diffusion.training_control import tensor_fingerprint
+        sampling_audit.update({
+            "initial_latent_sha256": tensor_fingerprint(initial_latents=latents),
+            "latent_shape": list(latents.shape), "latent_dtype": str(latents.dtype),
+            "timesteps": [int(value) for value in scheduler.timesteps.cpu().tolist()],
+            "eta": 0.0,
+        })
     conditional = condition_encoder(condition)
     unconditional = condition_encoder.unconditional(1, device=device, dtype=dtype)
     for timestep in scheduler.timesteps:

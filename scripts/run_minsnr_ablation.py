@@ -69,9 +69,10 @@ def make_arm_configs(protocol: dict, root: Path) -> tuple[dict, dict[str, dict]]
     source = yaml.safe_load(source_path.read_text(encoding="utf-8"))
     base = read_hparams(absolute(root, protocol["historical_hparams"]))
     output = absolute(root, protocol["output_root"])
+    data_root = absolute(root, protocol.get("data_root") or root)
     for key in ("manifest", "compositions", "heat_treatment"):
         if key in base["data"]:
-            base["data"][key] = str(absolute(root, base["data"][key]))
+            base["data"][key] = str(absolute(data_root, base["data"][key]))
     settings = protocol["training"]
     overrides = settings.get("performance", {})
     allowed = {"batch_size", "mixed_precision", "gradient_checkpointing", "num_workers",
@@ -106,13 +107,19 @@ def make_arm_configs(protocol: dict, root: Path) -> tuple[dict, dict[str, dict]]
         raise ValueError("Evaluation seeds must be non-empty and unique.")
     if len(set(evaluation["alloy_ids"])) != len(evaluation["alloy_ids"]) or not evaluation["alloy_ids"]:
         raise ValueError("Evaluation alloy IDs must be non-empty and unique.")
+    heldout_ids = evaluation.get("heldout_alloy_ids", [])
+    if (len(set(heldout_ids)) != len(heldout_ids)
+            or set(heldout_ids) & set(evaluation["alloy_ids"])):
+        raise ValueError("Held-out report IDs must be unique and separate from monitor IDs.")
+    if heldout_ids and heldout_ids != [int(protocol["exclude_alloy_id"])]:
+        raise ValueError("The separate held-out report must contain only the excluded alloy.")
     if evaluation["sampling_dtype"] not in {"float16", "float32"}:
         raise ValueError("sampling_dtype must be float16 or float32.")
     if evaluation["height"] != base["data"]["patch_size"] or evaluation["width"] != base["data"]["patch_size"]:
         raise ValueError("Primary evaluation must use the training patch size.")
     base["seed"] = int(settings["seed"])
     base["train_diffusion"].update({
-        "vae_dir": str(absolute(root, source["vae_dir"])),
+        "vae_dir": str(absolute(data_root, source["vae_dir"])),
         "max_steps": steps,
         "learning_rate": float(settings["learning_rate"]),
         "warmup_steps": warmup,
@@ -121,7 +128,8 @@ def make_arm_configs(protocol: dict, root: Path) -> tuple[dict, dict[str, dict]]
         "controlled_experiment": True,
         "deterministic": bool(settings["deterministic"]),
         "export_raw": True,
-        "initialization": {key: str(absolute(root, source[key])) for key in INITIALIZATION_FILES},
+        "lambda_gb": 0.0, "lambda_edge": 0.0,
+        "initialization": {key: str(absolute(data_root, source[key])) for key in INITIALIZATION_FILES},
     })
     arms = {}
     for name, gamma in ARMS.items():
@@ -153,6 +161,7 @@ def current_code_files(root: Path) -> list[Path]:
         "__init__.py", "run_minsnr_ablation.py", "sample_fold03_ab2c_256.py",
         "evaluate_ablation.py",
         "tune_minsnr_throughput.py",
+        "pack_minsnr_review.py",
     )]
     return files
 
@@ -164,6 +173,12 @@ def preflight(protocol: dict, root: Path, arms: dict[str, dict]) -> dict:
     assert paths is not None and provenance is not None
     if provenance["source_global_step"] != int(protocol["expected_source_step"]):
         raise ValueError("Source checkpoint step does not match the protocol.")
+    if "expected_latent_scaling" in protocol and not math.isclose(
+            provenance["latent_scaling"], float(protocol["expected_latent_scaling"]), rel_tol=1e-12):
+        raise ValueError("Source latent_scaling differs from the approved checkpoint.")
+    for key, expected in protocol.get("expected_source_sha256", {}).items():
+        if key not in provenance["sha256"] or provenance["sha256"][key] != expected:
+            raise ValueError(f"Source identity differs from the approved raw50k checkpoint: {key}")
     manifest_path = Path(config["data"]["manifest"])
     frame = pd.read_csv(manifest_path)
     selected = frame["use_for_diffusion"].astype(str).str.lower().isin({"1", "true", "yes", "y"})
@@ -184,6 +199,9 @@ def preflight(protocol: dict, root: Path, arms: dict[str, dict]) -> dict:
             if min(image.width - left - right, image.height - top - bottom) < dataset.patch_size:
                 raise ValueError(f"Image cannot provide the training patch: {row['image_path']}")
     vae_dir = Path(config["train_diffusion"]["vae_dir"])
+    for name, expected in protocol.get("expected_vae_sha256", {}).items():
+        if file_sha256(vae_dir / name) != expected:
+            raise ValueError(f"VAE identity differs from the approved shared VAE: {name}")
     vae = AutoencoderKL.from_pretrained(vae_dir).cpu().eval()
     unet, encoder, scheduler = load_initialized_models(paths, config["diffusion"], conditioner.dimension)
     scale = 2 ** (len(vae.config.block_out_channels) - 1)
@@ -198,7 +216,7 @@ def preflight(protocol: dict, root: Path, arms: dict[str, dict]) -> dict:
     evaluation_dataset = EbsdPatchDataset(
         manifest_path, dataset.patch_size, 1, "evaluation", crop_margins=dataset.crop_margins,
     )
-    for alloy_id in protocol["evaluation"]["alloy_ids"]:
+    for alloy_id in (*protocol["evaluation"]["alloy_ids"], *protocol["evaluation"].get("heldout_alloy_ids", [])):
         rows = [row for row in evaluation_dataset.rows if int(row["alloy_id"]) == int(alloy_id)]
         if len(rows) != 1:
             raise ValueError(f"Expected exactly one real image for evaluation alloy {alloy_id}.")
@@ -241,6 +259,9 @@ def prepare(protocol_path: Path, root: Path = PROJECT_ROOT) -> dict:
         destination = output / "source_snapshot" / path.relative_to(root)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, destination)
+        report["file_sha256"][str(destination)] = file_sha256(destination)
+    shutil.copy2(protocol_path, output / "configs" / "protocol.yaml")
+    report["file_sha256"][str(output / "configs" / "protocol.yaml")] = file_sha256(protocol_path)
     manifest = {
         "schema_version": 1,
         "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -254,6 +275,13 @@ def prepare(protocol_path: Path, root: Path = PROJECT_ROOT) -> dict:
         "preflight": report,
         "scientific_limit": "One matched continuation pilot; no causal proof from the 013 comparison.",
     }
+    try:
+        manifest["git_revision"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True, stderr=subprocess.DEVNULL).strip()
+        manifest["git_status"] = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=root, text=True, stderr=subprocess.DEVNULL).splitlines()
+    except (OSError, subprocess.CalledProcessError):
+        manifest["git_revision"] = None
     save_json(manifest, output / "experiment_manifest.json")
     return manifest
 
@@ -312,6 +340,16 @@ def verify_pair(output: Path, manifest: dict) -> dict:
     for rows in records.values():
         if [int(row["additional_step"]) for row in rows] != expected_steps:
             raise ValueError("Missing or duplicated input fingerprints; cannot verify matched inputs.")
+    if manifest["protocol"]["training"].get("require_diagnostics", False):
+        for arm in ARMS:
+            diagnostics = json.loads((output / arm / "training_diagnostics.json").read_text("utf-8"))
+            config = yaml.safe_load(Path(manifest["configs"][arm]).read_text("utf-8"))
+            samples = steps * int(config["train_diffusion"]["batch_size"])
+            if (diagnostics["successful_optimizer_steps"] != steps
+                    or diagnostics["sample_count"] != samples
+                    or sum(diagnostics["sample_counts_by_t_bin"]) != samples
+                    or diagnostics["amp_skipped_steps"] != 0):
+                raise ValueError(f"Incomplete training diagnostics: {arm}")
     if records["A_mse"] != records["B_minsnr5"]:
         raise ValueError("A/B sampled input fingerprints differ; do not interpret this as a single-variable result.")
     for key in ("torch", "python", "accelerate", "diffusers", "cuda", "device", "gpu_name",
@@ -338,7 +376,19 @@ def train(protocol_path: Path, root: Path = PROJECT_ROOT) -> dict:
                    "--exclude-alloy-id", str(manifest["protocol"]["exclude_alloy_id"]),
                    "--output-dir", str(directory)]
         print(f"Starting {arm}: {command}", flush=True)
-        subprocess.run(command, cwd=root, check=True)
+        # Keep logs outside the arm: train_diffusion refuses non-empty outputs.
+        log_path = output / "console_logs" / f"{arm}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("x", encoding="utf-8") as log:
+            with subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, bufsize=1) as process:
+                for line in process.stdout:
+                    print(line, end="", flush=True)
+                    log.write(line)
+                    log.flush()
+                returncode = process.wait()
+            if returncode:
+                raise subprocess.CalledProcessError(returncode, command)
         completed_metadata(output, arm, manifest)
     verification = verify_pair(output, manifest)
     save_json(verification, output / "matched_input_verification.json")
@@ -369,25 +419,66 @@ def reference_boxes(width: int, height: int, size: int, margins: list[int]) -> l
     return list(dict.fromkeys((x, y, x + size, y + size) for x, y in positions))
 
 
-def evaluate(protocol_path: Path, root: Path = PROJECT_ROOT) -> dict:
+def paired_comparisons(per_image: list[dict], real_descriptors: dict) -> list[dict]:
+    """Seed-paired descriptive errors, not an automatic scientific pass/fail."""
+    generated = {(row["alloy_id"], row["seed"], row["method"]): row
+                 for row in per_image if "seed" in row}
+    rows = []
+    for alloy, seed in sorted({(key[0], key[1]) for key in generated}):
+        reference_valid = all(item.grain_area_median_px > 0 for item in real_descriptors[alloy])
+        record = {"alloy_id": alloy, "seed": seed, "real_windows_valid_regions": reference_valid}
+        for field in ("grain_count", "gb_fraction", "edge_density"):
+            reference = float(np.median([getattr(item, field) for item in real_descriptors[alloy]]))
+            record[f"{field}_real_window_median"] = reference
+            errors = {}
+            for method in ("start_raw50k", *ARMS):
+                item = generated[alloy, seed, method]
+                value = float(item["descriptors"][field])
+                record[f"{field}_{method}"] = value
+                valid = reference_valid and item["valid_regions"] and value > 0 and reference > 0
+                errors[method] = abs(math.log(value / reference)) if valid else None
+                record[f"{field}_{method}_abs_log_error"] = errors[method]
+            a, b = errors["A_mse"], errors["B_minsnr5"]
+            record[f"{field}_delta_mse_minus_minsnr"] = a - b if a is not None and b is not None else None
+        rows.append(record)
+    return rows
+
+
+def evaluate(protocol_path: Path, root: Path = PROJECT_ROOT, *, heldout: bool = False,
+             review_note: Path | None = None) -> dict:
     output, manifest = load_prepared(protocol_path, root)
     verification = verify_pair(output, manifest)
-    evaluation_dir = output / "evaluation"
+    evaluation_dir = output / ("evaluation_heldout" if heldout else "evaluation")
     if evaluation_dir.exists() and any(evaluation_dir.iterdir()):
         raise FileExistsError(f"Refusing to overwrite evaluation: {evaluation_dir}")
     config = yaml.safe_load(Path(manifest["configs"]["A_mse"]).read_text("utf-8"))
     config["_project_root"] = str(root)
     paths, provenance = resolve_initialization(config)
     protocol = manifest["protocol"]
-    settings = protocol["evaluation"]
+    settings = deepcopy(protocol["evaluation"])
+    if heldout:
+        ids = settings.get("heldout_alloy_ids", [])
+        if not ids:
+            raise ValueError("This protocol has no separate held-out report.")
+        if not (output / "evaluation" / "run_metadata.json").is_file():
+            raise ValueError("Complete and review the training-alloy evaluation first.")
+        monitor = json.loads((output / "evaluation" / "run_metadata.json").read_text("utf-8"))
+        for name, expected in monitor.get("artifact_sha256", {}).items():
+            if file_sha256(output / "evaluation" / name) != expected:
+                raise ValueError(f"Monitor evaluation artifact changed before ID03: {name}")
+        if review_note is None or not review_note.read_text("utf-8").strip():
+            raise ValueError("Supply a non-empty --review-note locking the monitor conclusion before ID03.")
+        settings["alloy_ids"] = ids
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if protocol.get("require_cuda", True) and device.type != "cuda":
+        raise RuntimeError("CUDA is required for server evaluation; no silent CPU/FP32 fallback.")
     dtype = torch.float16 if settings["sampling_dtype"] == "float16" and device.type == "cuda" else torch.float32
     vae = AutoencoderKL.from_pretrained(config["train_diffusion"]["vae_dir"]).to(device=device, dtype=dtype).eval()
     compositions = load_compositions(config["data"]["compositions"])
     conditioner = load_frozen_conditioner(paths, set(manifest["preflight"]["training_alloy_ids"]), compositions)
     dataset = EbsdPatchDataset(config["data"]["manifest"], settings["height"], 1, "evaluation")
     per_image, summaries, real_descriptors = [], {}, {}
-    model_files = {}
+    model_files, sampling_inputs = {}, {}
     for alloy_id in settings["alloy_ids"]:
         row = next(row for row in dataset.rows if int(row["alloy_id"]) == int(alloy_id))
         folder = evaluation_dir / f"alloy_{alloy_id:02d}"
@@ -402,7 +493,9 @@ def evaluate(protocol_path: Path, root: Path = PROJECT_ROOT) -> dict:
                 descriptors.append(descriptor)
                 references.append((f"window {index}", path))
                 per_image.append({"method": "real_reference", "alloy_id": alloy_id,
-                                  "path": str(path), "box": list(box), "descriptors": descriptors_as_dict(descriptor)})
+                                  "path": str(path), "image_sha256": file_sha256(path),
+                                  "relative_path": path.relative_to(output).as_posix(),
+                                  "box": list(box), "descriptors": descriptors_as_dict(descriptor)})
         real_descriptors[alloy_id] = descriptors
         build_montage(folder / "real_windows.png", [("real windows (not paired seed targets)", references)],
                       (settings["width"], settings["height"]))
@@ -426,16 +519,25 @@ def evaluate(protocol_path: Path, root: Path = PROJECT_ROOT) -> dict:
                                      device=device, dtype=dtype).unsqueeze(0)
             descriptors, images = [], []
             for seed in settings["seeds"]:
+                sampling_audit = {}
                 generated = sample_image(unet, vae, encoder, scheduler, condition, provenance["latent_scaling"],
                                          int(seed), int(settings["steps"]), float(settings["guidance_scale"]),
-                                         settings["height"], settings["width"], settings["height"], settings["width"])
+                                         settings["height"], settings["width"], settings["height"], settings["width"],
+                                         sampling_audit=sampling_audit)
+                key = f"alloy_{alloy_id}_seed_{seed}"
+                if key in sampling_inputs and sampling_inputs[key] != sampling_audit:
+                    raise ValueError(f"Initial noise or DDIM grid differs across methods: {key}")
+                sampling_inputs[key] = sampling_audit
                 path = evaluation_dir / f"alloy_{alloy_id:02d}" / method / f"seed{seed}.png"
                 save_png(generated, path)
                 descriptor = describe_image(path, settings["gb_threshold"])
                 descriptors.append(descriptor)
                 images.append((f"seed {seed}", path))
                 per_image.append({"method": method, "weight_type": "raw", "alloy_id": alloy_id,
-                                  "seed": seed, "path": str(path), "descriptors": descriptors_as_dict(descriptor)})
+                                  "seed": seed, "path": str(path), "image_sha256": file_sha256(path),
+                                  "relative_path": path.relative_to(output).as_posix(),
+                                  "valid_regions": descriptor.grain_area_median_px > 0,
+                                  "sampling": sampling_audit, "descriptors": descriptors_as_dict(descriptor)})
                 print(f"Sampled {method} alloy {alloy_id:02d} seed {seed}", flush=True)
             summaries[str(alloy_id)]["methods"][method] = {
                 "image_count": len(descriptors), "scalar": scalar_distribution(descriptors),
@@ -449,6 +551,13 @@ def evaluate(protocol_path: Path, root: Path = PROJECT_ROOT) -> dict:
                       (settings["width"], settings["height"]))
     save_json(per_image, evaluation_dir / "per_image_metrics.json")
     save_json(summaries, evaluation_dir / "summary.json")
+    save_json(sampling_inputs, evaluation_dir / "sampling_inputs.json")
+    paired = paired_comparisons(per_image, real_descriptors)
+    save_json(paired, evaluation_dir / "paired_comparison.json")
+    with (evaluation_dir / "paired_comparison.csv").open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(paired[0]))
+        writer.writeheader()
+        writer.writerows(paired)
     csv_rows = []
     for alloy, entry in summaries.items():
         for method, values in entry["methods"].items():
@@ -463,13 +572,27 @@ def evaluate(protocol_path: Path, root: Path = PROJECT_ROOT) -> dict:
               "mode": "pure_noise_free_generation", "weight_type": "raw_only",
               "settings": settings, "device": str(device), "actual_dtype": str(dtype),
               "matched_input_verification": verification, "model_files": model_files,
-              "limits": ["One training seed, one held-out fold; pilot only.",
+              "report_scope": "exploratory_heldout_after_monitor_review" if heldout else "configured_alloys",
+              "protocol_sha256": manifest["protocol_sha256"], "git_revision": manifest.get("git_revision"),
+              "generated_image_count": len([row for row in per_image if "seed" in row]),
+              "limits": ["One training seed, one fold; pilot only.",
+                         "ID03 has been inspected during development; it is not a blind test or proof of whole-chain holdout.",
                          "Five real corner/center windows overlap; they are not independent samples.",
                          "Connected regions after threshold/dilation are not physical grain counts.",
+                         "Invalid region masks are flagged; their sentinel count is not a valid log-ratio observation.",
+                         "Positive paired delta means lower proxy error for Min-SNR, not a physical acceptance threshold.",
+                         "Hue histogram/JS distance is an RGB proxy, not a crystallographic orientation distribution.",
                          "No pixelwise target or target SSIM for free generation; review images and distributions jointly.",
                          "Lower weighted training loss is not an A/B quality comparison."]}
+    if heldout:
+        shutil.copy2(review_note, evaluation_dir / "monitor_review.txt")
+        report["monitor_review_sha256"] = file_sha256(evaluation_dir / "monitor_review.txt")
+    report["artifact_sha256"] = {
+        path.relative_to(evaluation_dir).as_posix(): file_sha256(path)
+        for path in sorted(evaluation_dir.rglob("*")) if path.is_file()
+    }
     save_json(report, evaluation_dir / "run_metadata.json")
-    manifest["status"] = "evaluated_pending_scientific_review"
+    manifest["status"] = "heldout_reported_pending_review" if heldout else "evaluated_pending_scientific_review"
     save_json(manifest, output / "experiment_manifest.json")
     return report
 
@@ -477,9 +600,13 @@ def evaluate(protocol_path: Path, root: Path = PROJECT_ROOT) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=Path("configs/fold03_minsnr_pilot.yaml"))
-    parser.add_argument("--phase", choices=("prepare", "train", "evaluate"), default="prepare")
+    parser.add_argument("--phase", choices=("prepare", "train", "evaluate", "evaluate-heldout"), default="prepare")
+    parser.add_argument("--review-note", type=Path, help="Monitor conclusion file, required only for evaluate-heldout.")
     args = parser.parse_args()
-    result = {"prepare": prepare, "train": train, "evaluate": evaluate}[args.phase](args.config.resolve())
+    if args.phase == "evaluate-heldout":
+        result = evaluate(args.config.resolve(), heldout=True, review_note=args.review_note)
+    else:
+        result = {"prepare": prepare, "train": train, "evaluate": evaluate}[args.phase](args.config.resolve())
     protocol = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     summary = {"phase": args.phase, "output_root": str(absolute(PROJECT_ROOT, protocol["output_root"]))}
     if args.phase == "prepare":

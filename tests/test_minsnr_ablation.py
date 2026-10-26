@@ -88,7 +88,7 @@ def tiny_protocol(tmp_path):
         "historical_hparams": str(source / "hparams.yaml"), "output_root": str(tmp_path / "run"),
         "exclude_alloy_id": 3, "expected_source_step": 50000, "require_cuda": False,
         "training": {"seed": 123, "additional_steps": 2, "learning_rate": 1e-3, "warmup_steps": 0,
-                     "save_every": 2, "log_every": 1, "deterministic": True},
+                     "save_every": 2, "log_every": 1, "deterministic": True, "require_diagnostics": True},
         "evaluation": {"alloy_ids": [1, 3], "seeds": [101, 102], "steps": 2, "guidance_scale": 1.8,
                        "height": 8, "width": 8, "gb_threshold": .18, "sampling_dtype": "float32"},
     }
@@ -154,8 +154,13 @@ def test_reference_boxes_honor_margins_and_remove_duplicates():
     assert boxes[-1] == (248, 96, 504, 352)
 
 
-def test_two_arm_training_and_free_generation_smoke(tiny_protocol, monkeypatch):
+@pytest.mark.parametrize("separate_heldout", [False, True])
+def test_two_arm_training_and_free_generation_smoke(tiny_protocol, monkeypatch, separate_heldout):
     path, protocol = tiny_protocol
+    if separate_heldout:
+        protocol["evaluation"]["alloy_ids"] = [1]
+        protocol["evaluation"]["heldout_alloy_ids"] = [3]
+        path.write_text(yaml.safe_dump(protocol), "utf-8")
     monkeypatch.setenv("ACCELERATE_USE_CPU", "true")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
     monkeypatch.setenv("OMP_NUM_THREADS", "1")
@@ -177,17 +182,53 @@ def test_two_arm_training_and_free_generation_smoke(tiny_protocol, monkeypatch):
             assert metadata["effective_total_step"] == 50002
             assert metadata["latent_scaling"] == 1.125
             assert (output / arm / "checkpoint-0000002" / "training_state.json").is_file()
+            stats = json.loads((output / arm / "training_diagnostics.json").read_text("utf-8"))
+            assert stats['successful_optimizer_steps'] == 2
+            assert stats['sample_count'] == 4
+            assert stats['amp_skipped_steps'] == 0
+            assert (output / "console_logs" / f"{arm}.log").stat().st_size > 0
             raw_states[arm] = load_file(str(output / arm / "final" / "unet_raw" / "diffusion_pytorch_model.safetensors"))
             checkpoint_state = load_file(str(output / arm / "checkpoint-0000002" / "model.safetensors"))
             assert all(torch.equal(value, checkpoint_state[key]) for key, value in raw_states[arm].items())
         assert any(not torch.equal(value, raw_states["B_minsnr5"][key]) for key, value in raw_states["A_mse"].items())
+        if separate_heldout:
+            with pytest.raises(ValueError, match='training-alloy evaluation first'):
+                evaluate(path, heldout=True)
         report = evaluate(path)
         assert report["mode"] == "pure_noise_free_generation"
         assert report["weight_type"] == "raw_only"
         assert report["actual_dtype"] == "torch.float32"
         entries = json.loads((output / "evaluation" / "per_image_metrics.json").read_text("utf-8"))
-        assert len([item for item in entries if "seed" in item]) == 12
-        assert (output / "evaluation" / "alloy_03" / "comparison_grid.png").is_file()
+        generated = [item for item in entries if "seed" in item]
+        assert len(generated) == (6 if separate_heldout else 12)
+        for alloy in protocol['evaluation']['alloy_ids']:
+            for seed in protocol['evaluation']['seeds']:
+                hashes = {item['sampling']['initial_latent_sha256'] for item in generated
+                          if item['alloy_id'] == alloy and item['seed'] == seed}
+                assert len(hashes) == 1
+        assert (output / 'evaluation' / 'paired_comparison.csv').is_file()
+        if separate_heldout:
+            with pytest.raises(ValueError, match='review-note'):
+                evaluate(path, heldout=True)
+            note = path.parent / 'review.txt'
+            note.write_text('Synthetic monitor review only; no scientific result.', 'utf-8')
+            heldout_report = evaluate(path, heldout=True, review_note=note)
+            assert heldout_report['generated_image_count'] == 6
+            assert (output / 'evaluation_heldout' / 'alloy_03' / 'comparison_grid.png').is_file()
+            assert (output / 'evaluation_heldout' / 'monitor_review.txt').read_bytes() == note.read_bytes()
+        else:
+            assert (output / "evaluation" / "alloy_03" / "comparison_grid.png").is_file()
+        from scripts.pack_minsnr_review import pack_review
+        import tarfile
+        bundle = pack_review(output)
+        with tarfile.open(bundle['path']) as archive:
+            names = archive.getnames()
+            assert 'REVIEW_FILES_SHA256.json' in names
+            assert 'configs/protocol.yaml' in names
+            assert 'A_mse/training_diagnostics.json' in names
+            assert not any(name.endswith(('.safetensors', '.bin', '.pkl')) for name in names)
+        with pytest.raises(FileExistsError, match='overwrite review bundle'):
+            pack_review(output)
         with pytest.raises(FileExistsError, match="overwrite evaluation"):
             evaluate(path)
         # Corrupted audit data must prevent a scientific A/B comparison.
@@ -197,6 +238,65 @@ def test_two_arm_training_and_free_generation_smoke(tiny_protocol, monkeypatch):
             verify_pair(output, manifest)
     finally:
         torch.set_num_threads(previous_threads)
+
+
+def test_separate_data_root_and_expected_source_identity(tiny_protocol):
+    from scripts.run_minsnr_ablation import PROJECT_ROOT, preflight
+    from ebsd_diffusion.training_control import file_sha256
+    path, protocol = tiny_protocol
+    source_path = Path(protocol['source_sampling_config'])
+    data_root = source_path.parent
+    source = yaml.safe_load(source_path.read_text('utf-8'))
+    for key in source:
+        source[key] = str(Path(source[key]).relative_to(data_root))
+    source_path.write_text(yaml.safe_dump(source), 'utf-8')
+    hp_path = Path(protocol['historical_hparams'])
+    hparams = yaml.safe_load(hp_path.read_text('utf-8'))
+    for key in ('data.manifest', 'data.compositions'):
+        hparams[key] = str(Path(hparams[key]).relative_to(data_root))
+    hp_path.write_text(yaml.safe_dump(hparams), 'utf-8')
+    protocol['data_root'] = str(data_root)
+    protocol['expected_source_sha256'] = {'raw_unet': file_sha256(data_root / 'raw.safetensors')}
+    _, arms = make_arm_configs(protocol, PROJECT_ROOT)
+    assert arms['A_mse']['data']['manifest'] == str(data_root / 'manifest.csv')
+    assert arms['A_mse']['train_diffusion']['initialization']['raw_unet'] == str(data_root / 'raw.safetensors')
+    preflight(protocol, PROJECT_ROOT, arms)
+    protocol['expected_source_sha256']['raw_unet'] = '0' * 64
+    with pytest.raises(ValueError, match='Source identity differs'):
+        preflight(protocol, PROJECT_ROOT, arms)
+
+
+def test_paired_log_errors_have_correct_direction_and_flag_invalid_masks():
+    from types import SimpleNamespace
+    from scripts.run_minsnr_ablation import paired_comparisons
+    reference = SimpleNamespace(grain_count=100, gb_fraction=.2, edge_density=.5, grain_area_median_px=10)
+    generated = []
+    for method, count in [('start_raw50k', 20), ('A_mse', 25), ('B_minsnr5', 50)]:
+        generated.append({'alloy_id': 5, 'seed': 1, 'method': method, 'valid_regions': True,
+                          'descriptors': {'grain_count': count, 'gb_fraction': .2, 'edge_density': .5}})
+    paired = paired_comparisons(generated, {5: [reference]})[0]
+    assert np.isclose(paired['grain_count_delta_mse_minus_minsnr'], np.log(2))
+    assert paired['gb_fraction_delta_mse_minus_minsnr'] == 0
+    generated[-1]['valid_regions'] = False
+    assert paired_comparisons(generated, {5: [reference]})[0]['grain_count_delta_mse_minus_minsnr'] is None
+
+
+def test_10k_protocol_budget_and_old_protocol_are_distinct():
+    from scripts.run_minsnr_ablation import PROJECT_ROOT
+    protocol = yaml.safe_load((PROJECT_ROOT / 'configs/fold03_raw50k_minsnr_10k.yaml').read_text('utf-8'))
+    old = yaml.safe_load((PROJECT_ROOT / 'configs/fold03_minsnr_pilot.yaml').read_text('utf-8'))
+    _, arms = make_arm_configs(protocol, PROJECT_ROOT)
+    assert protocol['training']['additional_steps'] == 10000
+    assert old['training']['additional_steps'] == 5000
+    assert protocol['output_root'] != old['output_root']
+    for arm in arms.values():
+        settings = arm['train_diffusion']
+        assert (settings['learning_rate'], settings['warmup_steps'], settings['batch_size']) == (3e-5, 500, 32)
+        assert settings['mixed_precision'] == 'fp16'
+        assert settings['gradient_checkpointing'] is True
+        assert settings['lambda_gb'] == settings['lambda_edge'] == 0
+    assert protocol['evaluation']['alloy_ids'] == [5, 7, 20]
+    assert protocol['evaluation']['heldout_alloy_ids'] == [3]
 
 
 def test_chunked_vae_preserves_posterior_draw_rng(tiny_protocol):
