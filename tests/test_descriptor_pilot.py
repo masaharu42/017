@@ -90,6 +90,12 @@ def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path,
     assert not (root / 'A_mse').exists()
     assert not (root / 'evaluation/alloy_03').exists()
     assert (root / 'evaluation/paired_descriptor_errors.csv').is_file()
+    from scripts.audit_descriptor_inputs import audit
+    replay = audit(pp)
+    assert replay['optimizer_updates'] == 0
+    assert replay['archived_replay_matches_history']
+    assert replay['new_code_matches_archived_replay_here']
+    assert all(replay['components_equal_here'].values())
     # A changed reference stream must fail BEFORE the first optimizer update,
     # rather than merely warning after a paid server run.
     config = yaml.safe_load(Path(manifest['config']).read_text())
