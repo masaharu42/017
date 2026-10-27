@@ -108,6 +108,32 @@ python -m scripts.run_descriptor_pilot --config configs/fold03_local5_10k.local.
 输出各合金comparison_grid、目标真实窗口、summary.json、paired_descriptor_errors.csv/json、
 sampling_inputs.json及带哈希的run_metadata.json。不会调用旧Min-SNR评价或开ID03。
 
+## 换卡后采用同机双臂（6000D）
+
+如果零更新复核显示：当前新旧代码首批各项指纹一致，但旧代码也无法复现历史
+4090 指纹，应使用 `configs/fold03_local5_pair_10k_large_vram.yaml`。
+这只定位到跨环境不可逐位复现，不能凭合并哈希断言具体是哪一个 CUDA 算子。
+旧主表、旧 MSE/Min-SNR 结果保持独立；此前失败的 local5 尚未完成一次更新。
+
+双臂都从原 A raw50k 开始，各新增 10k 步，依次训练 A_mse、B_local5；
+batch=32、FP16、LR/日程/随机种子均继承旧 A 配置，两臂都关闭梯度检查点。
+唯一科学差异为 B 的局部五维小编码器。B 对照新 A 的前五批和每个日志批指纹，
+不是宣称逐批穷尽核验。新 A 完成后冻结权重及指纹哈希，再启动 B。
+若 A 已完成并在 manifest 中登记，可复核哈希后跳过 A；部分输出仍不自动续训。
+
+```bash
+cp configs/fold03_local5_pair_10k_large_vram.yaml configs/fold03_local5_pair_10k_large_vram.local.yaml
+nohup bash -c 'python -u -m scripts.run_descriptor_pilot --config configs/fold03_local5_pair_10k_large_vram.local.yaml --phase prepare && python -u -m scripts.run_descriptor_pilot --config configs/fold03_local5_pair_10k_large_vram.local.yaml --phase train' > local5_pair_6000d.log 2>&1 < /dev/null &
+tail -f local5_pair_6000d.log
+```
+
+输出使用新的 `08_训练与生成结果/08_Fold03_raw50k_local5_pair_10k_6000D_运行`，
+不会覆盖此前的 06、07 目录。prepare 检查完成后训练自动衔接。
+断开 Mac 网络或关闭终端不会中断 nohup 进程，服务器须保持开机。
+训练完成后单独执行 `--phase evaluate`（使用同一 local YAML）：新采 A 6 张、B 18 张，
+只比较同机生成的这 24 张，旧 A 图不作为本次严格对照。额外控制图记录在
+`evaluation/control_images.json`，拼图 A 行明确写 fresh same-device。
+
 ## 判读
 
 先看同成分/同噪声下三个真实条件是否使组织粗细合理变化，五项误差逐项报告，

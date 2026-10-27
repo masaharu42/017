@@ -45,7 +45,8 @@ def test_large_vram_only_changes_execution_and_guards_memory(monkeypatch):
     assert torch.equal(before, torch.get_rng_state())
 
 
-def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path, monkeypatch):
+@pytest.mark.parametrize("paired", [False, True])
+def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path, monkeypatch, paired):
     """Two optimizer steps of tiny synthetic CPU models; no scientific run/data."""
     monkeypatch.setenv('ACCELERATE_USE_CPU', 'true')
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '-1')
@@ -66,6 +67,8 @@ def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path,
         'descriptor_settings': {'min_region_area_px': 1, 'boundary_dilation_px': 0,
                                 'coarse_diameter_px': 3.},
         'evaluation': {**protocol['evaluation'], 'target_quantiles': [.1,.5,.9]}}
+    if paired:
+        p["comparison_mode"] = "fresh_pair"
     pp = tmp_path / 'local.yaml'; pp.write_text(yaml.safe_dump(p))
     bad_protocol = tmp_path / 'uncertainty.yaml'
     bad_protocol.write_text(yaml.safe_dump({**p, 'uncertainty_inputs': True}))
@@ -80,14 +83,25 @@ def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path,
     with pytest.raises(FileExistsError):
         local.prepare(pp)
     result = local.train(pp)
-    assert result['new_training_arms'] == ['B_local5']
+    assert result['new_training_arms'] == (['A_mse', 'B_local5'] if paired else ['B_local5'])
     verified = json.loads((root / 'B_local5/matched_baseline_inputs.json').read_text())
     assert verified['status'] == 'passed' and verified['checked_steps'] == [1, 2]
     normalizer = json.loads((root / 'B_local5/final/condition_encoder/descriptor_normalizer.json').read_text())
     assert normalizer['training_alloy_ids'] == [1, 2]
     report = local.evaluate(pp)
-    assert report['new_samples'] == 12 and report['reused_control_images'] == 4
-    assert not (root / 'A_mse').exists()
+    assert report['new_samples'] == (16 if paired else 12)
+    assert report['reused_control_images'] == (0 if paired else 4)
+    assert (root / 'A_mse').exists() == paired
+    if paired:
+        assert (root / 'A_mse/input_fingerprints.csv').read_bytes() == (root / 'B_local5/input_fingerprints.csv').read_bytes()
+        assert report['new_control_images'] == 4
+        local.verify_control(json.loads((root / 'experiment_manifest.json').read_text()))
+        control_fingerprints = root / 'A_mse/input_fingerprints.csv'
+        original = control_fingerprints.read_bytes()
+        control_fingerprints.write_bytes(original + b'\n')
+        with pytest.raises(ValueError, match='Fresh control changed'):
+            local.verify_control(json.loads((root / 'experiment_manifest.json').read_text()))
+        control_fingerprints.write_bytes(original)
     assert not (root / 'evaluation/alloy_03').exists()
     assert (root / 'evaluation/paired_descriptor_errors.csv').is_file()
     from scripts.audit_descriptor_inputs import audit

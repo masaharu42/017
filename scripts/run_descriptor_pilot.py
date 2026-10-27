@@ -1,6 +1,6 @@
 """Local-five RGB proxy pilot: prepare on CPU; explicit server train/evaluate.
 
-Reuses the completed A_mse arm only after provenance and input-stream checks.
+Reuses A_mse after checks, or trains a fresh same-device MSE/local-five pair.
 Never launches the old Min-SNR phases, trains ID03, or overwrites a run.
 """
 from __future__ import annotations
@@ -40,6 +40,8 @@ def read_json(path):
 
 def read_protocol(path, root=ROOT):
     protocol = yaml.safe_load(Path(path).read_text("utf-8"))
+    if protocol.get("comparison_mode", "reuse_historical") not in {"reuse_historical", "fresh_pair"}:
+        raise ValueError("Unknown comparison_mode")
     if protocol["descriptor_hidden_dim"] != 32 or protocol.get("uncertainty_inputs") is not False:
         raise ValueError("Pilot fixes hidden_dim=32 and excludes uncertainty inputs")
     if not protocol.get("require_cuda", True) and not protocol.get("software_test_only", False):
@@ -289,10 +291,18 @@ def prepare(protocol_path, root=ROOT):
     for key in list(new_config):
         if key.startswith("_"):
             new_config.pop(key)
+    paired = protocol.get("comparison_mode") == "fresh_pair"
+    control_config = deepcopy(new_config)
+    control_config["train_diffusion"]["output_dir"] = str(output / "A_mse")
+    if paired:
+        fingerprints = output / "A_mse/input_fingerprints.csv"
     new_config["train_diffusion"].update({"output_dir": str(output / "B_local5"),
         "local_descriptors": {"metadata": str(output / "labels/metadata.json"),
                               "reference_fingerprints": str(fingerprints)}})
     (output / "configs").mkdir()
+    if paired:
+        (output / "configs/A_mse.yaml").write_text(
+            yaml.safe_dump(control_config, allow_unicode=True, sort_keys=False), "utf-8")
     config_path = output / "configs/B_local5.yaml"
     config_path.write_text(yaml.safe_dump(new_config, allow_unicode=True, sort_keys=False), "utf-8")
     shutil.copy2(protocol_path, output / "configs/protocol.yaml")
@@ -304,7 +314,7 @@ def prepare(protocol_path, root=ROOT):
     frozen.update({str(path): file_sha256(path) for path in current_code_files(root) + [root / n for n in NEW_CODE]})
     # Freeze source/weights/data and the existing control independently of code.
     frozen.update({str(Path(k)): file_sha256(Path(k)) for k in audit["file_sha256"]})
-    extra = [old_root / "experiment_manifest.json", fingerprints,
+    extra = [old_root / "experiment_manifest.json", old_root / "A_mse/input_fingerprints.csv",
              old_root / "A_mse/final/run_metadata.json", old_root / "evaluation/run_metadata.json",
              old_root / "evaluation/per_image_metrics.json", Path(protocol_path).resolve()]
     extra += [Path(r["path"]) for r in baseline_records]
@@ -314,7 +324,9 @@ def prepare(protocol_path, root=ROOT):
     frozen.update({str(p): file_sha256(p) for p in extra})
     result = {"schema_version": 1, "status": "prepared_not_trained", "project_root": str(root),
         "protocol": protocol, "baseline_run": str(old_root), "config": str(config_path),
-        "preflight": audit, "baseline_samples": baseline_records, "frozen_sha256": frozen,
+        "preflight": audit, "baseline_samples": [] if paired else baseline_records, "frozen_sha256": frozen,
+        "comparison_mode": "fresh_pair" if paired else "reuse_historical",
+        "control_config": str(output / "configs/A_mse.yaml") if paired else None,
         "descriptor_schema": metadata["schema"], "device_profile": hardware,
         "execution_override": {"baseline_gradient_checkpointing": config["train_diffusion"]["gradient_checkpointing"],
                                "new_gradient_checkpointing": new_config["train_diffusion"]["gradient_checkpointing"]},
@@ -343,6 +355,28 @@ def require_cuda(manifest):
         raise RuntimeError("Server CUDA is required; no automatic Mac/CPU training or sampling")
 
 
+def train_arm(output, root, name, config):
+    arm = output / name
+    if arm.exists() and any(arm.iterdir()):
+        raise FileExistsError(f"{name} already has output; no automatic retraining/resume")
+    command = [sys.executable, str(root / "train_diffusion.py"), "--config", config,
+               "--exclude-alloy-id", "3"]
+    (output / "console_logs").mkdir(exist_ok=True)
+    with (output / f"console_logs/{name}.log").open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, bufsize=1)
+        for line in process.stdout:
+            print(line, end="", flush=True); log.write(line); log.flush()
+        if process.wait():
+            raise RuntimeError(f"{name} failed; inspect console log; no automatic retry")
+
+
+def verify_control(manifest):
+    for name, digest in manifest["control_artifact_sha256"].items():
+        if file_sha256(Path(name)) != digest:
+            raise ValueError(f"Fresh control changed: {name}")
+
+
 def train(protocol_path, root=ROOT):
     output, manifest = load_prepared(protocol_path, root)
     require_cuda(manifest)
@@ -352,19 +386,22 @@ def train(protocol_path, root=ROOT):
         if hardware["gpu_name"] != prepared["gpu_name"] or hardware["total_vram_gib"] != prepared["total_vram_gib"]:
             raise RuntimeError("GPU changed after prepare; prepare a new run on this GPU")
         save_json(hardware, output / "device_at_train.json")
+    paired = manifest.get("comparison_mode") == "fresh_pair"
+    if paired:
+        if "control_artifact_sha256" not in manifest:
+            train_arm(output, root, "A_mse", manifest["control_config"])
+            control_metadata = read_json(output / "A_mse/final/run_metadata.json")
+            if (control_metadata["global_step"] != manifest["protocol"]["expected_additional_steps"]
+                    or control_metadata["source_global_step"] != manifest["protocol"]["expected_source_step"]):
+                raise ValueError("Fresh control incomplete or wrong source")
+            files = list((output / "A_mse/final").rglob("*"))
+            files += [output / "A_mse/input_fingerprints.csv", output / "A_mse/initialization_metadata.json"]
+            manifest["control_artifact_sha256"] = {str(p): file_sha256(p) for p in files if p.is_file()}
+            manifest["status"] = "control_complete_pending_local5"
+            save_json(manifest, output / "experiment_manifest.json")
+        verify_control(manifest)
+    train_arm(output, root, "B_local5", manifest["config"])
     arm = output / "B_local5"
-    if arm.exists() and any(arm.iterdir()):
-        raise FileExistsError("B_local5 already has output; no automatic retraining/resume")
-    command = [sys.executable, str(root / "train_diffusion.py"), "--config", manifest["config"],
-               "--exclude-alloy-id", "3"]
-    (output / "console_logs").mkdir(exist_ok=True)
-    with (output / "console_logs/B_local5.log").open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(command, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                   text=True, bufsize=1)
-        for line in process.stdout:
-            print(line, end="", flush=True); log.write(line); log.flush()
-        if process.wait():
-            raise RuntimeError("B_local5 failed; inspect console log; no automatic retry")
     audit = read_json(arm / "matched_baseline_inputs.json")
     metadata = read_json(arm / "final/run_metadata.json")
     if audit["status"] != "passed" or metadata["global_step"] != manifest["protocol"]["expected_additional_steps"]:
@@ -373,8 +410,8 @@ def train(protocol_path, root=ROOT):
     manifest["trained_artifact_sha256"] = {str(p): file_sha256(p) for p in (arm / "final").rglob("*") if p.is_file()}
     manifest["trained_artifact_sha256"][str(arm / "matched_baseline_inputs.json")] = file_sha256(arm / "matched_baseline_inputs.json")
     save_json(manifest, output / "experiment_manifest.json")
-    return {"status": manifest["status"], "new_training_arms": ["B_local5"],
-            "reused_baseline": manifest["baseline_run"]}
+    return {"status": manifest["status"], "new_training_arms": ["A_mse", "B_local5"] if paired else ["B_local5"],
+            "reused_baseline": None if paired else manifest["baseline_run"]}
 
 
 def evaluate(protocol_path, root=ROOT):
@@ -407,19 +444,44 @@ def evaluate(protocol_path, root=ROOT):
     conditioner = CompositionConditioner.load(final / "composition_conditioner.json")
     compositions = load_compositions(config["data"]["compositions"])
     metadata = read_json(final / "run_metadata.json")
+    paired = manifest.get("comparison_mode") == "fresh_pair"
+    controls_all = manifest["baseline_samples"]
+    if paired:
+        from ebsd_diffusion.models import ContinuousConditionEmbedding
+        verify_control(manifest)
+        control_final = output / "A_mse/final"
+        control_unet = UNet2DModel.from_pretrained(control_final / "unet_raw").to(device=device, dtype=dtype).eval()
+        control_encoder = ContinuousConditionEmbedding.from_pretrained(control_final / "condition_encoder").to(device=device, dtype=dtype).eval()
+        control_scheduler = DDIMScheduler.from_pretrained(control_final / "scheduler")
+        control_metadata = read_json(control_final / "run_metadata.json")
+        controls_all = []
+        for aid in settings["alloy_ids"]:
+            condition = torch.tensor(conditioner.transform_by_alloy_id(compositions, aid), device=device, dtype=dtype).unsqueeze(0)
+            for seed in settings["seeds"]:
+                audit = {}
+                generated = sample_image(control_unet, vae, control_encoder, control_scheduler, condition,
+                    control_metadata["latent_scaling"], seed, settings["steps"], settings["guidance_scale"],
+                    settings["height"], settings["width"], settings["height"], settings["width"], sampling_audit=audit)
+                path = folder / f"fresh_controls/alloy_{aid:02d}_seed{seed}.png"
+                save_png(generated, path)
+                controls_all.append({"alloy_id": aid, "seed": seed, "path": str(path),
+                    "image_sha256": file_sha256(path), "sampling": audit,
+                    "metrics": descriptors_as_dict(describe_image(path, settings["gb_threshold"]))})
+        save_json(controls_all, folder / "control_images.json")
+        del control_unet, control_encoder
     descriptor_meta = read_json(output / "labels/metadata.json")
     targets = read_json(output / "labels/monitor_targets.json")
     image_entries = {r["alloy_id"]: r for r in descriptor_meta["images"]}
     summaries, pairs, inputs = [], [], []
     for aid in settings["alloy_ids"]:
         grid = []
-        controls = [r for r in manifest["baseline_samples"] if r["alloy_id"] == aid]
+        controls = [r for r in controls_all if r["alloy_id"] == aid]
         control_paths = []
         for r in controls:
             dest = folder / f"alloy_{aid:02d}/A_mse" / Path(r["path"]).name
             dest.parent.mkdir(parents=True, exist_ok=True); shutil.copy2(r["path"], dest)
             control_paths.append((f"seed {r['seed']}", dest))
-        grid.append(("A_mse reused (composition only)", control_paths))
+        grid.append(("A_mse fresh same-device" if paired else "A_mse reused (composition only)", control_paths))
         condition = torch.tensor(conditioner.transform_by_alloy_id(compositions, aid), device=device, dtype=dtype).unsqueeze(0)
         for target in [r for r in targets if r["alloy_id"] == aid]:
             with Image.open(image_entries[aid]["image_path"]) as source:
@@ -472,7 +534,10 @@ def evaluate(protocol_path, root=ROOT):
                    for r in summaries]
     with (folder / "summary.csv").open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(scalar_rows[0])); writer.writeheader(); writer.writerows(scalar_rows)
-    report = {"new_samples": len(summaries), "reused_control_images": len(manifest["baseline_samples"]),
+    report = {"new_samples": len(summaries) + (len(controls_all) if paired else 0),
+        "new_local5_samples": len(summaries), "new_control_images": len(controls_all) if paired else 0,
+        "comparison_mode": manifest.get("comparison_mode", "reuse_historical"),
+        "reused_control_images": len(manifest["baseline_samples"]),
         "weight_type": "raw_only", "uncertainty_inputs": False,
         "scope": manifest["scientific_scope"], "primary_measure": "five individual proxy errors and morphology; scalar mean is secondary",
         "limits": "two seeds; known training-alloy descriptors; correlated windows; threshold-based RGB regions, not physical grains; ID03 not evaluated",
