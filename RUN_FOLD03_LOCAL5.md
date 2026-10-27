@@ -43,6 +43,25 @@ input_fingerprints.csv、evaluation的PNG与元数据，以及它原先引用的
 
 ## 命令
 
+### 6000D / 大显存服务器
+
+使用 `configs/fold03_local5_10k_large_vram.yaml`，复制成同名 `.local.yaml` 后运行相同阶段。
+该配置关闭梯度检查点，用更多激活显存换取减少重算；batch仍继承旧A的32，精度和学习率不变。
+不预分配或强行占满84GB。prepare读取真实GPU型号、总显存和空闲显存，并运行微型FP16兼容检查；
+要求总显存≥64GiB、空闲≥48GiB。这是启动保护，不是精确峰值预测，真实峰值仍记录在训练结果中。
+默认配置保留旧执行设置，大显存配置会如实记录checkpointing执行差异。
+
+换GPU/驱动可能使VAE等计算出现逐位差异。即使数学设置相同，也不保证旧指纹匹配；
+首次不匹配会停止，不能关闭核对继续宣称严格对照。届时应检查环境，或另立同设备匹配对照，
+本脚本不会自动追加另一臂。若旧运行目录来自另一台机器，还需保持原绝对数据/权重路径可用。
+
+```bash
+cp configs/fold03_local5_10k_large_vram.yaml configs/fold03_local5_10k_large_vram.local.yaml
+python -m scripts.run_descriptor_pilot --config configs/fold03_local5_10k_large_vram.local.yaml --phase prepare
+```
+
+后续train/evaluate都使用这个large_vram.local.yaml；使用新的输出目录，不复用已经prepare的旧目录。
+
 在服务器项目根目录、上一轮Python环境中执行：
 
 ```bash

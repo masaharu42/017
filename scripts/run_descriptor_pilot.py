@@ -55,7 +55,57 @@ def read_protocol(path, root=ROOT):
     validate_settings(protocol.get("descriptor_settings", {}))
     if protocol["normalizer_windows_per_alloy"] < 3:
         raise ValueError("Need at least three normalization windows per alloy")
+    execution = protocol.get("execution", {})
+    allowed = {"gradient_checkpointing", "min_total_vram_gib", "min_free_vram_gib"}
+    if set(execution) - allowed:
+        raise ValueError("Only checkpointing and memory guards may change; batch/precision remain matched")
+    if "gradient_checkpointing" in execution and not isinstance(execution["gradient_checkpointing"], bool):
+        raise ValueError("gradient_checkpointing must be boolean")
+    for key in ("min_total_vram_gib", "min_free_vram_gib"):
+        if key in execution and (isinstance(execution[key], bool) or not isinstance(execution[key], (int, float))
+                                 or not np.isfinite(execution[key]) or execution[key] <= 0):
+            raise ValueError(f"Invalid execution {key}")
     return protocol, absolute(root, protocol["output_root"])
+
+
+def execution_config(config, protocol):
+    result = deepcopy(config)
+    execution = protocol.get("execution", {})
+    if "gradient_checkpointing" in execution:
+        result["train_diffusion"]["gradient_checkpointing"] = execution["gradient_checkpointing"]
+    return result
+
+
+def device_profile(protocol):
+    """Read real device capacity; a larger VRAM number is never fabricated."""
+    execution = protocol.get("execution", {})
+    if not execution:
+        return None
+    if not torch.cuda.is_available():
+        raise RuntimeError("Large-VRAM profile requires a server CUDA device")
+    device = torch.cuda.current_device()
+    props = torch.cuda.get_device_properties(device)
+    free, total = torch.cuda.mem_get_info(device)
+    gib = 1024 ** 3
+    report = {"gpu_name": props.name, "total_vram_gib": total / gib,
+              "free_vram_gib": free / gib, "compute_capability": list(torch.cuda.get_device_capability(device)),
+              "torch": torch.__version__, "cuda": torch.version.cuda,
+              "compiled_architectures": torch.cuda.get_arch_list()}
+    for threshold, observed in (("min_total_vram_gib", total / gib), ("min_free_vram_gib", free / gib)):
+        if observed < execution.get(threshold, 0):
+            raise RuntimeError(f"GPU memory guard failed: {threshold}={execution[threshold]}, actual={observed:.2f} GiB; {props.name}")
+    # A tiny nonrandom kernel catches incompatible CUDA builds without advancing
+    # the training RNG or loading any experiment model onto the GPU.
+    try:
+        a = torch.ones((32, 32), device=device, dtype=torch.float16)
+        result = a @ a
+        if not bool(torch.isfinite(result).all()) or float(result[0, 0]) != 32:
+            raise RuntimeError("FP16 kernel self-check failed")
+        del a, result
+    except RuntimeError as exc:
+        raise RuntimeError(f"GPU/runtime compatibility check failed on {props.name}; verify this GPU's PyTorch/CUDA build") from exc
+    report["fp16_kernel_check"] = "passed"
+    return report
 
 
 def verify_baseline(protocol, root=ROOT):
@@ -221,6 +271,12 @@ def prepare(protocol_path, root=ROOT):
     if output.exists() and any(output.iterdir()):
         raise FileExistsError(f"Choose a new output_root: {output}")
     old_root, old, config, _, fingerprints = verify_baseline(protocol, root)
+    hardware = device_profile(protocol)
+    if hardware:
+        old_environment = read_json(old_root / "A_mse/initialization_metadata.json")
+        hardware["baseline_gpu_name"] = old_environment.get("gpu_name")
+        hardware["device_changed"] = hardware["gpu_name"] != hardware["baseline_gpu_name"]
+        hardware["comparison_limit"] = "Checkpointing-off is an execution override. Cross-device numerical identity is not assumed; audited training fingerprints must still match."
     baseline_records = baseline_samples(old_root, old, protocol)
     # Reuse the old scientific preflight; no Min-SNR training is launched.
     audit = preflight(old["protocol"], root, {"A_mse": config})
@@ -229,7 +285,7 @@ def prepare(protocol_path, root=ROOT):
             raise ValueError(f"Current preflight differs from baseline: {key}")
     output.mkdir(parents=True, exist_ok=True)
     metadata = prepare_labels(config, protocol, output, audit["training_alloy_ids"])
-    new_config = deepcopy(config)
+    new_config = execution_config(config, protocol)
     for key in list(new_config):
         if key.startswith("_"):
             new_config.pop(key)
@@ -259,7 +315,9 @@ def prepare(protocol_path, root=ROOT):
     result = {"schema_version": 1, "status": "prepared_not_trained", "project_root": str(root),
         "protocol": protocol, "baseline_run": str(old_root), "config": str(config_path),
         "preflight": audit, "baseline_samples": baseline_records, "frozen_sha256": frozen,
-        "descriptor_schema": metadata["schema"],
+        "descriptor_schema": metadata["schema"], "device_profile": hardware,
+        "execution_override": {"baseline_gradient_checkpointing": config["train_diffusion"]["gradient_checkpointing"],
+                               "new_gradient_checkpointing": new_config["train_diffusion"]["gradient_checkpointing"]},
         "scientific_scope": "training-alloy known-local-RGB-proxy control screening, not composition-only generalization"}
     try:
         result["git_revision"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
@@ -288,6 +346,12 @@ def require_cuda(manifest):
 def train(protocol_path, root=ROOT):
     output, manifest = load_prepared(protocol_path, root)
     require_cuda(manifest)
+    hardware = device_profile(manifest["protocol"])
+    if hardware:
+        prepared = manifest["device_profile"]
+        if hardware["gpu_name"] != prepared["gpu_name"] or hardware["total_vram_gib"] != prepared["total_vram_gib"]:
+            raise RuntimeError("GPU changed after prepare; prepare a new run on this GPU")
+        save_json(hardware, output / "device_at_train.json")
     arm = output / "B_local5"
     if arm.exists() and any(arm.iterdir()):
         raise FileExistsError("B_local5 already has output; no automatic retraining/resume")
@@ -425,7 +489,7 @@ def main():
     parser.add_argument("--phase", choices=["prepare", "train", "evaluate"], default="prepare")
     args = parser.parse_args()
     result = {"prepare": prepare, "train": train, "evaluate": evaluate}[args.phase](args.config.resolve())
-    print(json.dumps({k: v for k, v in result.items() if k in ("status", "descriptor_schema", "new_samples", "reused_control_images", "new_training_arms")}, ensure_ascii=False, indent=2))
+    print(json.dumps({k: v for k, v in result.items() if k in ("status", "descriptor_schema", "device_profile", "execution_override", "new_samples", "reused_control_images", "new_training_arms")}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

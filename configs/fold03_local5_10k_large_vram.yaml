@@ -1,0 +1,31 @@
+# Large-VRAM preset for the rented 6000D. Actual name/capacity are probed.
+# Batch stays at the old A_mse value (32); no assumed 84/96-GB label.
+name: fold03_raw50k_local5_10k_large_vram
+baseline_run: 08_训练与生成结果/06_Fold03_raw50k_MSE_MinSNR5_10k_运行
+output_root: 08_训练与生成结果/07_Fold03_raw50k_local5_10k_6000D_运行
+expected_source_step: 50000
+expected_additional_steps: 10000
+require_cuda: true
+descriptor_hidden_dim: 32
+uncertainty_inputs: false
+execution:
+  gradient_checkpointing: false
+  min_total_vram_gib: 64
+  min_free_vram_gib: 48
+descriptor_settings:
+  black_threshold: 51
+  boundary_dilation_px: 1
+  min_region_area_px: 10
+  coarse_diameter_px: 20.0
+  min_regions: 3
+normalizer_windows_per_alloy: 64
+evaluation:
+  alloy_ids: [5, 7, 20]
+  seeds: [20261012, 20261013]
+  target_quantiles: [0.1, 0.5, 0.9]
+  steps: 50
+  guidance_scale: 1.8
+  height: 256
+  width: 256
+  sampling_dtype: float16
+  gb_threshold: 0.18

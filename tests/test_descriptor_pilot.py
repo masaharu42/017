@@ -2,15 +2,47 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 from PIL import Image
 import pytest
 import yaml
+import torch
 
 from test_minsnr_ablation import tiny_protocol
 from test_local_descriptors import grid
 from scripts import run_descriptor_pilot as local
 from scripts import run_minsnr_ablation as old
+
+
+def test_large_vram_only_changes_execution_and_guards_memory(monkeypatch):
+    p, _ = local.read_protocol(local.ROOT / 'configs/fold03_local5_10k_large_vram.yaml')
+    config = {'data': {'num_workers': 4}, 'train_diffusion': {'batch_size': 32,
+        'mixed_precision': 'fp16', 'gradient_checkpointing': True, 'max_steps': 10000}}
+    changed = local.execution_config(config, p)
+    assert config['train_diffusion']['gradient_checkpointing'] is True
+    assert changed['train_diffusion']['gradient_checkpointing'] is False
+    assert changed['train_diffusion']['batch_size'] == 32
+    assert changed['train_diffusion']['mixed_precision'] == 'fp16'
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    with pytest.raises(RuntimeError, match='server CUDA'):
+        local.device_profile(p)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda device: SimpleNamespace(name='synthetic-GPU'))
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda device: (12, 0))
+    monkeypatch.setattr(torch.cuda, 'get_arch_list', lambda: ['sm_120'])
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda device: (40 * 1024**3, 96 * 1024**3))
+    with pytest.raises(RuntimeError, match='min_free_vram_gib'):
+        local.device_profile(p)
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda device: (84 * 1024**3, 96 * 1024**3))
+    original_ones = torch.ones
+    monkeypatch.setattr(torch, 'ones', lambda shape, **kw: original_ones(shape, dtype=kw['dtype']))
+    before = torch.get_rng_state()
+    report = local.device_profile(p)
+    assert report['total_vram_gib'] == 96 and report['free_vram_gib'] == 84
+    assert report['fp16_kernel_check'] == 'passed'
+    assert torch.equal(before, torch.get_rng_state())
 
 
 def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path, monkeypatch):

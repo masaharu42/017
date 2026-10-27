@@ -9,6 +9,7 @@ from ebsd_diffusion.data import EbsdPatchDataset
 from ebsd_diffusion.descriptor_conditioning import DescriptorConditionEmbedding, FixedDescriptorCondition
 from ebsd_diffusion.local_descriptors import DEFAULTS, NAMES, SCHEMA, LocalDescriptorStore, describe_rgb
 from ebsd_diffusion.models import ContinuousConditionEmbedding
+from ebsd_diffusion.models import build_unet
 
 
 def grid(size=24):
@@ -96,3 +97,22 @@ def test_constructor_also_preserves_cuda_rng():
     before = torch.cuda.get_rng_state_all()
     DescriptorConditionEmbedding(ContinuousConditionEmbedding(6, 128, 512))
     assert all(torch.equal(a, b) for a, b in zip(before, torch.cuda.get_rng_state_all()))
+
+
+def test_checkpointing_switch_preserves_tiny_unet_outputs_and_gradients():
+    model = build_unet({'block_out_channels': [32], 'layers_per_block': 1}, 4, 8).train()
+    x = torch.randn(1, 4, 8, 8)
+    c = torch.randn(1, 128)
+    outputs, grads = [], []
+    for enabled in (True, False):
+        if enabled:
+            model.enable_gradient_checkpointing()
+        else:
+            model.disable_gradient_checkpointing()
+        model.zero_grad(set_to_none=True)
+        result = model(x.clone().requires_grad_(), torch.tensor([3]), class_labels=c.clone().requires_grad_()).sample
+        result.square().mean().backward()
+        outputs.append(result.detach())
+        grads.append([p.grad.clone() for p in model.parameters() if p.grad is not None])
+    assert torch.equal(outputs[0], outputs[1])
+    assert len(grads[0]) == len(grads[1]) and all(torch.allclose(a, b, rtol=1e-6, atol=1e-7) for a,b in zip(*grads))
