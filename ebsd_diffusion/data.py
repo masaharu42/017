@@ -41,6 +41,7 @@ class EbsdPatchDataset(Dataset):
         vertical_flip: bool = False,
         rotate_180: bool = False,
         deterministic: bool = False,
+        descriptor_store=None,
     ) -> None:
         if target not in {"vae", "diffusion", "evaluation"}:
             raise ValueError(f"Unsupported dataset target: {target}")
@@ -83,6 +84,7 @@ class EbsdPatchDataset(Dataset):
         self.vertical_flip = vertical_flip
         self.rotate_180 = rotate_180
         self.deterministic = deterministic
+        self.descriptor_store = descriptor_store
 
     @property
     def alloy_ids(self) -> list[int]:
@@ -98,7 +100,7 @@ class EbsdPatchDataset(Dataset):
         with Image.open(image_path) as source:
             image = source.convert("RGB")
         image = self._content_crop(image)
-        image = self._patch_crop(image, index)
+        image, patch_box = self._patch_with_box(image, index)
 
         if not self.deterministic:
             if self.horizontal_flip and torch.rand(()) < 0.5:
@@ -118,6 +120,14 @@ class EbsdPatchDataset(Dataset):
             if alloy_id not in self.conditions:
                 raise KeyError(f"No normalized condition for alloy {alloy_id}.")
             result["condition"] = torch.as_tensor(self.conditions[alloy_id], dtype=torch.float32)
+            if self.descriptor_store is not None:
+                top, _, _, left = self.crop_margins
+                x0, y0, x1, y1 = patch_box
+                native_box = (x0 + left, y0 + top, x1 + left, y1 + top)
+                values, valid = self.descriptor_store.lookup(image_path, native_box, rgb=np.asarray(image))
+                result["descriptors"] = torch.as_tensor(values, dtype=torch.float32)
+                result["descriptor_valid"] = torch.tensor(valid, dtype=torch.bool)
+                result["native_box"] = torch.tensor(native_box, dtype=torch.long)
         return result
 
     def _content_crop(self, image: Image.Image) -> Image.Image:
@@ -128,6 +138,9 @@ class EbsdPatchDataset(Dataset):
         return image.crop((left, top, width - right, height - bottom))
 
     def _patch_crop(self, image: Image.Image, index: int) -> Image.Image:
+        return self._patch_with_box(image, index)[0]
+
+    def _patch_with_box(self, image: Image.Image, index: int):
         width, height = image.size
         if width < self.patch_size or height < self.patch_size:
             raise ValueError(
@@ -139,7 +152,8 @@ class EbsdPatchDataset(Dataset):
         else:
             left = int(torch.randint(0, width - self.patch_size + 1, ()).item())
             top = int(torch.randint(0, height - self.patch_size + 1, ()).item())
-        return image.crop((left, top, left + self.patch_size, top + self.patch_size))
+        box = (left, top, left + self.patch_size, top + self.patch_size)
+        return image.crop(box), box
 
 
 def build_condition_mapping(composition_frame, conditioner, alloy_ids) -> dict[int, np.ndarray]:

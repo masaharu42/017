@@ -23,6 +23,8 @@ from tqdm.auto import tqdm
 from ebsd_diffusion.composition import CompositionConditioner, load_compositions
 from ebsd_diffusion.config import flatten_config_for_logging, load_config, resolve_project_path
 from ebsd_diffusion.data import EbsdPatchDataset, build_condition_mapping
+from ebsd_diffusion.descriptor_conditioning import DescriptorConditionEmbedding
+from ebsd_diffusion.local_descriptors import LocalDescriptorStore
 from ebsd_diffusion.losses import diffusion_mse_loss, validate_snr_gamma
 from ebsd_diffusion.training_diagnostics import TrainingDiagnostics
 from ebsd_diffusion.training_control import (
@@ -91,6 +93,24 @@ def main() -> None:
     if benchmark_steps and args.resume_from:
         raise ValueError("Benchmark must start fresh, not resume.")
     controlled = bool(train_cfg.get("controlled_experiment", False))
+    descriptor_cfg = train_cfg.get("local_descriptors")
+    descriptor_store = None
+    reference_fingerprints = None
+    compared_steps = []
+    if descriptor_cfg:
+        if not controlled or args.resume_from or benchmark_steps:
+            raise ValueError("Local-five pilot requires a fresh controlled run")
+        if train_cfg.get("snr_gamma") is not None:
+            raise ValueError("Local-five pilot uses ordinary MSE, not Min-SNR")
+        descriptor_store = LocalDescriptorStore(resolve_project_path(config, descriptor_cfg["metadata"]))
+        with resolve_project_path(config, descriptor_cfg["reference_fingerprints"]).open(newline="") as handle:
+            import csv
+            rows = list(csv.DictReader(handle))
+        reference_fingerprints = {int(row["additional_step"]): row["sha256"] for row in rows}
+        expected_steps = set(range(1, 6)) & set(range(1, int(train_cfg["max_steps"]) + 1))
+        expected_steps |= set(range(int(train_cfg["log_every"]), int(train_cfg["max_steps"]) + 1, int(train_cfg["log_every"])))
+        if set(reference_fingerprints) != expected_steps or len(rows) != len(expected_steps):
+            raise ValueError("Reference fingerprints do not cover the exact audit steps")
     if controlled and args.resume_from:
         raise ValueError("This matched pilot uses fresh weights-only starts, not --resume-from.")
     if bool(train_cfg.get("deterministic", False)):
@@ -178,6 +198,7 @@ def main() -> None:
         horizontal_flip=bool(data_cfg["horizontal_flip"]),
         vertical_flip=bool(data_cfg["vertical_flip"]),
         rotate_180=bool(data_cfg["rotate_180"]),
+        descriptor_store=descriptor_store,
     )
     loader = DataLoader(
         dataset,
@@ -220,6 +241,11 @@ def main() -> None:
         )
     if bool(train_cfg.get("gradient_checkpointing", False)):
         unet.enable_gradient_checkpointing()
+
+    if descriptor_cfg:
+        if sorted(dataset.alloy_ids) != descriptor_store.metadata["training_alloy_ids"]:
+            raise ValueError("Descriptor normalizer/maps must use exactly the training fold")
+        condition_encoder = DescriptorConditionEmbedding(condition_encoder)
 
     optimizer_options = {}
     if train_cfg.get("fused_adamw", False):
@@ -336,15 +362,34 @@ def main() -> None:
                 drop_mask = torch.rand(conditions.shape[0], device=conditions.device) < float(
                     model_cfg["condition_dropout"]
                 )
-                class_embedding = condition_encoder(vicinal_condition, drop_mask=drop_mask)
+                if descriptor_cfg:
+                    class_embedding = condition_encoder(
+                        vicinal_condition, drop_mask=drop_mask,
+                        descriptors=batch["descriptors"], descriptor_valid=batch["descriptor_valid"])
+                else:
+                    class_embedding = condition_encoder(vicinal_condition, drop_mask=drop_mask)
                 if controlled and (global_step < 5 or (global_step + 1) % int(train_cfg["log_every"]) == 0):
+                    fingerprint = tensor_fingerprint(
+                        images=images, conditions=conditions, latents=latents,
+                        noise=noise, timesteps=timesteps,
+                        vicinal_condition=vicinal_condition, drop_mask=drop_mask)
+                    if reference_fingerprints is not None:
+                        step = global_step + 1
+                        if reference_fingerprints.get(step) != fingerprint:
+                            raise RuntimeError(f"Baseline input mismatch at step {step}; stopping before update")
+                        compared_steps.append(step)
+                        save_json({"status": "in_progress", "checked_steps": compared_steps,
+                                   "scope": "first five and logged batches, not every batch"},
+                                  output_dir / "matched_baseline_inputs.json")
+                        append_csv_row(output_dir / "descriptor_inputs.csv", {
+                            "additional_step": step,
+                            "valid_fraction": float(batch["descriptor_valid"].float().mean()),
+                            "sha256": tensor_fingerprint(descriptors=batch["descriptors"],
+                                valid=batch["descriptor_valid"], native_box=batch["native_box"]),
+                        })
                     append_csv_row(output_dir / "input_fingerprints.csv", {
                         "additional_step": global_step + 1,
-                        "sha256": tensor_fingerprint(
-                            images=images, conditions=conditions, latents=latents,
-                            noise=noise, timesteps=timesteps,
-                            vicinal_condition=vicinal_condition, drop_mask=drop_mask,
-                        ),
+                        "sha256": fingerprint,
                     })
                 prediction = unet(
                     noisy_latents,
@@ -394,6 +439,11 @@ def main() -> None:
                     )
                     if controlled and not torch.isfinite(gradient_norm).item():
                         raise RuntimeError("Non-finite pilot gradients; review both arms before continuing.")
+                descriptor_grad_norm = None
+                if descriptor_cfg and (global_step < 5 or (global_step + 1) % int(train_cfg["log_every"]) == 0 or global_step + 1 == loop_steps):
+                    projection = accelerator.unwrap_model(condition_encoder).projection
+                    descriptor_grad_norm = float(torch.sqrt(sum(
+                        p.grad.detach().float().square().sum() for p in projection.parameters() if p.grad is not None)))
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -425,6 +475,9 @@ def main() -> None:
                         "condition_drop_fraction": float(drop_mask.float().mean()),
                         **diagnostic_logs,
                     }
+                    if descriptor_cfg:
+                        logs["descriptor_valid_fraction"] = float(batch["descriptor_valid"].float().mean())
+                        logs["descriptor_projection_grad_norm_after_clip"] = descriptor_grad_norm
                     if controlled or snr_gamma is not None:
                         logs["unweighted_mse"] = float(
                             (prediction.detach().float() - target.float()).square().mean()
@@ -555,8 +608,19 @@ def main() -> None:
         raw_unet.save_pretrained(final_dir / "unet", safe_serialization=True)
         ema.restore(raw_unet.parameters())
         raw_condition_encoder.save_pretrained(final_dir / "condition_encoder")
+        if descriptor_cfg:
+            save_json({key: descriptor_store.metadata[key] for key in (
+                "schema", "names", "settings", "units", "region_rule",
+                "normalizer", "training_alloy_ids")},
+                final_dir / "condition_encoder" / "descriptor_normalizer.json")
         noise_scheduler.save_pretrained(final_dir / "scheduler")
         conditioner.save(final_dir / "composition_conditioner.json")
+        if descriptor_cfg:
+            if set(compared_steps) != set(reference_fingerprints):
+                raise RuntimeError("Incomplete baseline input audit")
+            save_json({"status": "passed", "checked_steps": compared_steps,
+                       "scope": "first five and logged batches, not every batch"},
+                      output_dir / "matched_baseline_inputs.json")
         final_timing = tracker.finish(global_step) if tracker is not None else None
         save_json(
             {
@@ -565,6 +629,7 @@ def main() -> None:
                 "effective_total_step": global_step + (initialization_report["source_global_step"] if initialization_report else 0),
                 "initialization": initialization_report,
                 "snr_gamma": snr_gamma,
+                "local_descriptors": descriptor_cfg,
                 "unet_weight_types": {
                     "unet": "ema_unet_with_raw_condition_encoder",
                     **({"unet_raw": "raw"} if train_cfg.get("export_raw") else {}),
