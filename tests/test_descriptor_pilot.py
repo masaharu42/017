@@ -45,7 +45,7 @@ def test_large_vram_only_changes_execution_and_guards_memory(monkeypatch):
     assert torch.equal(before, torch.get_rng_state())
 
 
-@pytest.mark.parametrize("paired", [False, True, "restart"])
+@pytest.mark.parametrize("paired", [False, True, "restart", "cross"])
 def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path, monkeypatch, paired):
     """Two optimizer steps of tiny synthetic CPU models; no scientific run/data."""
     monkeypatch.setenv('ACCELERATE_USE_CPU', 'true')
@@ -82,7 +82,7 @@ def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path,
     assert {r['alloy_id'] for r in meta['images']} == {1, 2}
     with pytest.raises(FileExistsError):
         local.prepare(pp)
-    if paired == "restart":
+    if paired in ("restart", "cross"):
         original_train_arm = local.train_arm
         def interrupt_B(output, root, name, config):
             if name == "B_local5":
@@ -94,22 +94,47 @@ def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path,
         with pytest.raises(RuntimeError, match="synthetic interrupted B"):
             local.train(pp)
         monkeypatch.setattr(local, "train_arm", original_train_arm)
-        from scripts import restart_local5 as restart_module
-        monkeypatch.setattr(restart_module, "device_profile", lambda protocol: {
-            "gpu_name": "synthetic changed device", "total_vram_gib": 96})
-        restart = restart_module.restart
-        with pytest.raises(ValueError, match="Device changed"):
-            restart(pp)
-        with pytest.raises(FileExistsError):
-            restart(pp, accept_device_change=True)
-        result = restart(pp, archive_failed=True, accept_device_change=True)
-        assert result["new_training_arms"] == ["B_local5"]
-        assert len(list(root.glob("B_local5_interrupted_*"))) == 1
+        if paired == "restart":
+            from scripts import restart_local5 as restart_module
+            monkeypatch.setattr(restart_module, "device_profile", lambda protocol: {
+                "gpu_name": "synthetic changed device", "total_vram_gib": 96})
+            restart = restart_module.restart
+            with pytest.raises(ValueError, match="Device changed"):
+                restart(pp)
+            with pytest.raises(FileExistsError):
+                restart(pp, accept_device_change=True)
+            result = restart(pp, archive_failed=True, accept_device_change=True)
+            assert result["new_training_arms"] == ["B_local5"]
+            assert len(list(root.glob("B_local5_interrupted_*"))) == 1
+        else:
+            # Simulate GPU-dependent historical hashes while keeping the
+            # actual A weights/data fixed; the new policy must report this.
+            from scripts.run_local5_cross_device import prepare, train
+            fingerprint_path = root / "A_mse/input_fingerprints.csv"
+            lines = fingerprint_path.read_text().splitlines()
+            fingerprint_path.write_text(lines[0] + "\n" + "\n".join(
+                line.split(",")[0] + ",foreign_gpu_tensor_hash" for line in lines[1:]) + "\n")
+            record_path = root / "experiment_manifest.json"
+            record = json.loads(record_path.read_text())
+            from ebsd_diffusion.training_control import file_sha256
+            record["control_artifact_sha256"][str(fingerprint_path)] = file_sha256(fingerprint_path)
+            record_path.write_text(json.dumps(record))
+            original_A_hash = file_sha256(root / "A_mse/final/unet_raw/diffusion_pytorch_model.safetensors")
+            pp = prepare(pp)
+            result = train(pp)
+            root = pp.parent.parent
+            manifest = json.loads((root / "experiment_manifest.json").read_text())
+            assert (root / "A_mse").is_symlink()
+            assert file_sha256(root / "A_mse/final/unet_raw/diffusion_pytorch_model.safetensors") == original_A_hash
+            assert result["new_training_arms"] == ["B_local5"]
     else:
         result = local.train(pp)
         assert result['new_training_arms'] == (['A_mse', 'B_local5'] if paired else ['B_local5'])
     verified = json.loads((root / 'B_local5/matched_baseline_inputs.json').read_text())
-    assert verified['status'] == 'passed' and verified['checked_steps'] == [1, 2]
+    assert verified['status'] == ('completed_cross_device_screening' if paired == 'cross' else 'passed')
+    assert verified['checked_steps'] == [1, 2]
+    if paired == 'cross':
+        assert verified['historical_mismatch_steps'] == [1, 2]
     normalizer = json.loads((root / 'B_local5/final/condition_encoder/descriptor_normalizer.json').read_text())
     assert normalizer['training_alloy_ids'] == [1, 2]
     report = local.evaluate(pp)
@@ -117,7 +142,8 @@ def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path,
     assert report['reused_control_images'] == (0 if paired else 4)
     assert (root / 'A_mse').exists() == bool(paired)
     if paired:
-        assert (root / 'A_mse/input_fingerprints.csv').read_bytes() == (root / 'B_local5/input_fingerprints.csv').read_bytes()
+        if paired != 'cross':
+            assert (root / 'A_mse/input_fingerprints.csv').read_bytes() == (root / 'B_local5/input_fingerprints.csv').read_bytes()
         assert report['new_control_images'] == 4
         local.verify_control(json.loads((root / 'experiment_manifest.json').read_text()))
         control_fingerprints = root / 'A_mse/input_fingerprints.csv'
@@ -141,6 +167,7 @@ def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path,
     bad_reference.write_text('additional_step,sha256\n1,wrong\n2,wrong\n')
     config['train_diffusion']['output_dir'] = str(tmp_path / 'must_stop')
     config['train_diffusion']['local_descriptors']['reference_fingerprints'] = str(bad_reference)
+    config['train_diffusion']['local_descriptors']['input_comparison_policy'] = 'strict_tensor_identity'
     bad_config = tmp_path / 'bad_config.yaml'; bad_config.write_text(yaml.safe_dump(config))
     failed = subprocess.run([sys.executable, str(local.ROOT / 'train_diffusion.py'), '--config',
         str(bad_config), '--exclude-alloy-id', '3'], capture_output=True, text=True)

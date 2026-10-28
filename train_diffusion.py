@@ -28,6 +28,7 @@ from ebsd_diffusion.local_descriptors import LocalDescriptorStore
 from ebsd_diffusion.losses import diffusion_mse_loss, validate_snr_gamma
 from ebsd_diffusion.training_diagnostics import TrainingDiagnostics
 from ebsd_diffusion.training_control import (
+    file_sha256,
     load_frozen_conditioner,
     load_initialized_models,
     resolve_initialization,
@@ -97,12 +98,31 @@ def main() -> None:
     descriptor_store = None
     reference_fingerprints = None
     compared_steps = []
+    fingerprint_mismatches = []
+    input_policy = "strict_tensor_identity"
+    cross_replay = None
     if descriptor_cfg:
         if not controlled or args.resume_from or benchmark_steps:
             raise ValueError("Local-five pilot requires a fresh controlled run")
         if train_cfg.get("snr_gamma") is not None:
             raise ValueError("Local-five pilot uses ordinary MSE, not Min-SNR")
         descriptor_store = LocalDescriptorStore(resolve_project_path(config, descriptor_cfg["metadata"]))
+        input_policy = descriptor_cfg.get("input_comparison_policy", "strict_tensor_identity")
+        if input_policy not in {"strict_tensor_identity", "cross_device_screening"}:
+            raise ValueError("Unknown local-five input comparison policy")
+        if input_policy == "cross_device_screening":
+            replay_path = resolve_project_path(config, descriptor_cfg["zero_update_replay"])
+            if file_sha256(replay_path) != descriptor_cfg["zero_update_replay_sha256"]:
+                raise ValueError("Cross-device replay report changed")
+            cross_replay = json.loads(replay_path.read_text("utf-8"))
+            if (cross_replay.get("optimizer_updates") != 0
+                    or not cross_replay.get("new_code_matches_archived_replay_here")
+                    or not cross_replay.get("components_equal_here")
+                    or not all(cross_replay["components_equal_here"].values())):
+                raise ValueError("Cross-device screening requires a passing zero-update A/B replay")
+            actual_gpu = torch.cuda.get_device_name() if torch.cuda.is_available() else None
+            if cross_replay["results"]["current_local5"]["gpu"] != actual_gpu:
+                raise ValueError("GPU differs from the zero-update replay")
         with resolve_project_path(config, descriptor_cfg["reference_fingerprints"]).open(newline="") as handle:
             import csv
             rows = list(csv.DictReader(handle))
@@ -375,10 +395,22 @@ def main() -> None:
                         vicinal_condition=vicinal_condition, drop_mask=drop_mask)
                     if reference_fingerprints is not None:
                         step = global_step + 1
-                        if reference_fingerprints.get(step) != fingerprint:
+                        matched = reference_fingerprints.get(step) == fingerprint
+                        if not matched and input_policy == "strict_tensor_identity":
                             raise RuntimeError(f"Baseline input mismatch at step {step}; stopping before update")
+                        if cross_replay is not None:
+                            if step == 1 and fingerprint != cross_replay["results"]["current_local5"]["combined_sha256"]:
+                                raise RuntimeError("First batch differs from the verified same-device replay")
+                            if not matched:
+                                fingerprint_mismatches.append(step)
+                            append_csv_row(output_dir / "cross_device_inputs.csv", {
+                                "additional_step": step, "historical_tensor_hash_matches": matched,
+                                "images_conditions_sha256": tensor_fingerprint(images=images, conditions=conditions),
+                                "actual_tensor_sha256": fingerprint,
+                                "historical_tensor_sha256": reference_fingerprints[step]})
                         compared_steps.append(step)
                         save_json({"status": "in_progress", "checked_steps": compared_steps,
+                                   "policy": input_policy, "historical_mismatch_steps": fingerprint_mismatches,
                                    "scope": "first five and logged batches, not every batch"},
                                   output_dir / "matched_baseline_inputs.json")
                         append_csv_row(output_dir / "descriptor_inputs.csv", {
@@ -618,7 +650,10 @@ def main() -> None:
         if descriptor_cfg:
             if set(compared_steps) != set(reference_fingerprints):
                 raise RuntimeError("Incomplete baseline input audit")
-            save_json({"status": "passed", "checked_steps": compared_steps,
+            save_json({"status": "passed" if cross_replay is None else "completed_cross_device_screening",
+                       "checked_steps": compared_steps, "policy": input_policy,
+                       "historical_mismatch_steps": fingerprint_mismatches,
+                       "limits": "Same-device first batch replay verified; historical per-step tensor identity is not claimed" if cross_replay else None,
                        "scope": "first five and logged batches, not every batch"},
                       output_dir / "matched_baseline_inputs.json")
         final_timing = tracker.finish(global_step) if tracker is not None else None

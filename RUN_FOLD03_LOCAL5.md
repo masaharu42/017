@@ -154,6 +154,31 @@ nohup python -u -m scripts.restart_local5 \
 `restart_B_*.json` 记录原设备、新设备、失败目录归档位置和启动脚本哈希。
 当前仅适用于 A 完成而 B 未完成的双臂目录；拒绝覆盖 B 的 final。
 
+### 换卡后历史合并指纹不同：单独的跨设备筛查目录
+
+若历史 A 在新卡上的首批重放也与旧卡哈希不同，使用以下入口；它不训练 A：
+
+```bash
+nohup python -u -m scripts.run_local5_cross_device \
+  --config configs/fold03_local5_pair_10k_large_vram.local.yaml \
+  > local5_cross_device.log 2>&1 < /dev/null &
+```
+
+先用历史 A 源码和当前 B 源码，在当前 GPU 各重放一批，明确禁止优化器更新，
+七项输入全部匹配才允许继续。随后新建 `10_Fold03_local5_cross_device_*_运行`，
+以只读使用方式链接已完成 A，复制原描述符元数据，记录新代码及原始归档哈希。
+只重新训练 B 的 10k；旧 B 和 2000 步 checkpoint 保留，不在原目录改写冻结哈希。
+
+跨设备策略保留数据/配置/权重身份核验、405 个日志批的实际指纹及图像条件指纹。
+第一批必须匹配当前设备上的零更新重放；历史 GPU 合并指纹差异逐步记入
+`cross_device_inputs.csv`，完成标记为 `completed_cross_device_screening`，不标为
+历史逐位一致。该证据只支持同协议跨设备筛查，不证明完整历史批次逐位相同。
+默认严格策略不变；缺少有效重放报告或首批实际输入变化仍停止。
+
+日志会打印 `RUN_CONFIG=.../configs/protocol.yaml`。完成训练后，使用该新配置路径
+执行本模块的 `--phase evaluate`；它复用 A 权重在当前卡采图，与 B 同卡采样，
+不会调用 A 训练。报告的 scope 明确保留跨设备训练和小样本边界。
+
 先看同成分/同噪声下三个真实条件是否使组织粗细合理变化，五项误差逐项报告，
 同时审阅颜色、边缘和形态。标准化平均误差只是附加摘要，不能靠碎点或黑线增多判成功。
 仅两种子、训练内已知描述符、相关窗口；不能宣称新合金成功或真实晶粒/取向物理一致。
