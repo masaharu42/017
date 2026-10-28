@@ -55,16 +55,17 @@ def worker(job_path):
     raise RuntimeError("No first-batch capture; audit incomplete")
 
 
-def audit(protocol_path, root=None):
+def audit(protocol_path, root=None, control_run=None):
     root = Path(root or Path(__file__).resolve().parents[1]).resolve()
     protocol = yaml.safe_load(Path(protocol_path).read_text("utf-8"))
     output = Path(protocol["output_root"])
     if not output.is_absolute():
         output = root / output
     manifest = json.loads((output / "experiment_manifest.json").read_text("utf-8"))
-    baseline = Path(manifest["baseline_run"])
+    baseline = Path(control_run) if control_run is not None else Path(manifest["baseline_run"])
+    paired_control = control_run is not None
     old_manifest = json.loads((baseline / "experiment_manifest.json").read_text("utf-8"))
-    configs = {"archived_mse": Path(old_manifest["configs"]["A_mse"]),
+    configs = {"archived_mse": Path(old_manifest["control_config"] if paired_control else old_manifest["configs"]["A_mse"]),
                "current_local5": Path(manifest["config"])}
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     folder = output / "input_audits" / stamp
@@ -88,6 +89,7 @@ def audit(protocol_path, root=None):
         expected = next(r["sha256"] for r in csv.DictReader(handle) if int(r["additional_step"]) == 1)
     old, current = results["archived_mse"], results["current_local5"]
     report = {"optimizer_updates": 0, "historical_step1_sha256": expected,
+        "control_run": str(baseline),
         "archived_replay_matches_history": old["combined_sha256"] == expected,
         "new_code_matches_archived_replay_here": current["combined_sha256"] == old["combined_sha256"],
         "components_equal_here": {k: v["sha256"] == current["components"][k]["sha256"] for k,v in old["components"].items()},
@@ -101,11 +103,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--worker", type=Path)
+    parser.add_argument("--control-run", type=Path)
     args = parser.parse_args()
     if args.worker:
         worker(args.worker)
     elif args.config:
-        audit(args.config)
+        audit(args.config, control_run=args.control_run)
     else:
         parser.error("Supply --config")
 
