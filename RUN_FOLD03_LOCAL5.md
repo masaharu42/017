@@ -136,6 +136,24 @@ tail -f local5_pair_6000d.log
 
 ## 判读
 
+### 已完成 A 后，仅重新启动失败的 B（允许记录换卡）
+
+换卡本身不要求重训已完成的 A。已有 A 哈希核验通过时，可显式接受跨设备筛查，
+保留原协议与源码哈希，归档中断的 B，再从原 raw50k 起点重新运行 B 的 10k。
+这不是从 2000 步 checkpoint 续训。新入口不调用 A 训练，原输入指纹核对继续生效；
+若发生不一致仍停止，不能把数值差异和数据错配混为一谈。
+启动前确认没有其他训练进程；先 git pull，再执行：
+
+```bash
+nohup python -u -m scripts.restart_local5 \
+  --config configs/fold03_local5_pair_10k_large_vram.local.yaml \
+  --accept-device-change --archive-failed-B \
+  > local5_B_only_restart.log 2>&1 < /dev/null &
+```
+
+`restart_B_*.json` 记录原设备、新设备、失败目录归档位置和启动脚本哈希。
+当前仅适用于 A 完成而 B 未完成的双臂目录；拒绝覆盖 B 的 final。
+
 先看同成分/同噪声下三个真实条件是否使组织粗细合理变化，五项误差逐项报告，
 同时审阅颜色、边缘和形态。标准化平均误差只是附加摘要，不能靠碎点或黑线增多判成功。
 仅两种子、训练内已知描述符、相关窗口；不能宣称新合金成功或真实晶粒/取向物理一致。

@@ -45,7 +45,7 @@ def test_large_vram_only_changes_execution_and_guards_memory(monkeypatch):
     assert torch.equal(before, torch.get_rng_state())
 
 
-@pytest.mark.parametrize("paired", [False, True])
+@pytest.mark.parametrize("paired", [False, True, "restart"])
 def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path, monkeypatch, paired):
     """Two optimizer steps of tiny synthetic CPU models; no scientific run/data."""
     monkeypatch.setenv('ACCELERATE_USE_CPU', 'true')
@@ -82,8 +82,32 @@ def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path,
     assert {r['alloy_id'] for r in meta['images']} == {1, 2}
     with pytest.raises(FileExistsError):
         local.prepare(pp)
-    result = local.train(pp)
-    assert result['new_training_arms'] == (['A_mse', 'B_local5'] if paired else ['B_local5'])
+    if paired == "restart":
+        original_train_arm = local.train_arm
+        def interrupt_B(output, root, name, config):
+            if name == "B_local5":
+                (output / name).mkdir()
+                (output / name / "interrupted.txt").write_text("synthetic interruption")
+                raise RuntimeError("synthetic interrupted B")
+            return original_train_arm(output, root, name, config)
+        monkeypatch.setattr(local, "train_arm", interrupt_B)
+        with pytest.raises(RuntimeError, match="synthetic interrupted B"):
+            local.train(pp)
+        monkeypatch.setattr(local, "train_arm", original_train_arm)
+        from scripts import restart_local5 as restart_module
+        monkeypatch.setattr(restart_module, "device_profile", lambda protocol: {
+            "gpu_name": "synthetic changed device", "total_vram_gib": 96})
+        restart = restart_module.restart
+        with pytest.raises(ValueError, match="Device changed"):
+            restart(pp)
+        with pytest.raises(FileExistsError):
+            restart(pp, accept_device_change=True)
+        result = restart(pp, archive_failed=True, accept_device_change=True)
+        assert result["new_training_arms"] == ["B_local5"]
+        assert len(list(root.glob("B_local5_interrupted_*"))) == 1
+    else:
+        result = local.train(pp)
+        assert result['new_training_arms'] == (['A_mse', 'B_local5'] if paired else ['B_local5'])
     verified = json.loads((root / 'B_local5/matched_baseline_inputs.json').read_text())
     assert verified['status'] == 'passed' and verified['checked_steps'] == [1, 2]
     normalizer = json.loads((root / 'B_local5/final/condition_encoder/descriptor_normalizer.json').read_text())
@@ -91,7 +115,7 @@ def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path,
     report = local.evaluate(pp)
     assert report['new_samples'] == (16 if paired else 12)
     assert report['reused_control_images'] == (0 if paired else 4)
-    assert (root / 'A_mse').exists() == paired
+    assert (root / 'A_mse').exists() == bool(paired)
     if paired:
         assert (root / 'A_mse/input_fingerprints.csv').read_bytes() == (root / 'B_local5/input_fingerprints.csv').read_bytes()
         assert report['new_control_images'] == 4
