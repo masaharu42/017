@@ -5,6 +5,8 @@ import json
 import os
 import platform
 import time
+import math
+import statistics
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +28,7 @@ from ebsd_diffusion.data import EbsdPatchDataset, build_condition_mapping
 from ebsd_diffusion.descriptor_conditioning import DescriptorConditionEmbedding
 from ebsd_diffusion.local_descriptors import LocalDescriptorStore
 from ebsd_diffusion.losses import diffusion_mse_loss, validate_snr_gamma
+from ebsd_diffusion.boundary_loss import boundary_dice_loss
 from ebsd_diffusion.training_diagnostics import TrainingDiagnostics
 from ebsd_diffusion.training_control import (
     file_sha256,
@@ -59,6 +62,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lambda-gb", type=float)
     parser.add_argument("--lambda-edge", type=float)
     parser.add_argument("--structure-max-t", type=int)
+    parser.add_argument("--boundary-calibrate", action="store_true",
+                        help="Measure boundary/MSE gradients without optimizer updates.")
+    parser.add_argument("--software-test-cpu", action="store_true",
+                        help="CPU only for synthetic software tests.")
     parser.add_argument("--benchmark-steps", type=int, default=0,
                         help="Disposable optimizer updates; writes timing only, never exports weights.")
     parser.add_argument("--benchmark-warmup", type=int, default=3)
@@ -87,6 +94,8 @@ def main() -> None:
     composition_cfg = config["composition"]
     model_cfg = config["diffusion"]
     train_cfg = config["train_diffusion"]
+    if args.software_test_cpu and int(data_cfg["patch_size"]) != 8:
+        raise ValueError("--software-test-cpu is restricted to 8x8 synthetic fixtures.")
     benchmark_steps = int(getattr(args, "benchmark_steps", 0))
     benchmark_warmup = int(getattr(args, "benchmark_warmup", 3))
     if benchmark_steps < 0 or (benchmark_steps and not 0 < benchmark_warmup < benchmark_steps):
@@ -94,6 +103,29 @@ def main() -> None:
     if benchmark_steps and args.resume_from:
         raise ValueError("Benchmark must start fresh, not resume.")
     controlled = bool(train_cfg.get("controlled_experiment", False))
+    boundary_cfg = train_cfg.get("boundary_dice")
+    if args.boundary_calibrate and not boundary_cfg:
+        raise ValueError("Boundary calibration requires boundary_dice configuration.")
+    if boundary_cfg:
+        if not controlled or args.resume_from or benchmark_steps or train_cfg.get("local_descriptors"):
+            raise ValueError("Boundary pilot requires fresh composition-only controlled training.")
+        if train_cfg.get("snr_gamma") is not None or train_cfg.get("lambda_gb", 0) or train_cfg.get("lambda_edge", 0):
+            raise ValueError("Boundary pilot uses ordinary MSE without other structure losses.")
+        if boundary_cfg.get("max_t") != 300 or boundary_cfg.get("max_samples") != 8:
+            raise ValueError("Boundary pilot fixes max_t=300 and max_samples=8.")
+        if not args.boundary_calibrate:
+            calibration_path = resolve_project_path(config, boundary_cfg["calibration_file"])
+            calibration = json.loads(calibration_path.read_text("utf-8"))
+            if calibration.get("optimizer_updates") != 0 or calibration.get("status") != "passed":
+                raise ValueError("A passing zero-update boundary calibration is required.")
+            if calibration.get("config_sha256") != file_sha256(args.config):
+                raise ValueError("Calibration belongs to a different training configuration.")
+            if calibration.get("gpu_name") != (torch.cuda.get_device_name() if torch.cuda.is_available() else None):
+                raise ValueError("Calibration and training must use the same GPU.")
+            boundary_weight = float(calibration["lambda"])
+            if not math.isfinite(boundary_weight) or boundary_weight <= 0:
+                raise ValueError("Invalid calibrated boundary weight.")
+    calibration_ratios = []
     descriptor_cfg = train_cfg.get("local_descriptors")
     descriptor_store = None
     reference_fingerprints = None
@@ -156,7 +188,8 @@ def main() -> None:
     structure_max_t = int(train_cfg.get("structure_max_t", 0))
     if controlled and (lambda_gb != 0.0 or lambda_edge != 0.0):
         raise ValueError("The matched Min-SNR pilot requires both structure loss weights to be zero.")
-    loop_steps = benchmark_steps or int(train_cfg["max_steps"])
+    loop_steps = (int(boundary_cfg.get("calibration_batches", 8)) if args.boundary_calibrate
+                  else benchmark_steps or int(train_cfg["max_steps"]))
     initialization, initialization_report = resolve_initialization(config)
 
     output_dir = args.output_dir.resolve() if args.output_dir else resolve_project_path(config, train_cfg["output_dir"])
@@ -165,6 +198,7 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     accelerator = Accelerator(
+        cpu=args.software_test_cpu,
         gradient_accumulation_steps=int(train_cfg["gradient_accumulation_steps"]),
         mixed_precision=str(train_cfg["mixed_precision"]),
         log_with="tensorboard",
@@ -441,6 +475,45 @@ def main() -> None:
                     snr_gamma=snr_gamma,
                     prediction_type=noise_scheduler.config.prediction_type,
                 )
+                boundary_loss = prediction.new_zeros(())
+                if boundary_cfg:
+                    selected = torch.nonzero(timesteps <= boundary_cfg["max_t"], as_tuple=True)[0][:boundary_cfg["max_samples"]]
+                    if len(selected):
+                        alpha_bar = noise_scheduler.alphas_cumprod.to(latents.device)[timesteps[selected]]
+                        alpha = alpha_bar.sqrt().view(-1, 1, 1, 1)
+                        sigma = (1 - alpha_bar).sqrt().view(-1, 1, 1, 1)
+                        x0 = (noisy_latents[selected].float() - sigma * prediction[selected].float()) / alpha
+                        decoded = vae.decode(x0 / latent_scaling).sample
+                        boundary_loss = boundary_dice_loss(decoded, images[selected], threshold=0.2, temperature=0.05)
+                    if args.boundary_calibrate:
+                        if len(selected):
+                            parameters = [p for p in accelerator.unwrap_model(unet).parameters() if p.requires_grad]
+                            def grad_norm(objective):
+                                gradients = torch.autograd.grad(objective, parameters, retain_graph=True, allow_unused=True)
+                                squares = [g.detach().float().square().sum() for g in gradients if g is not None]
+                                return float(torch.stack(squares).sum().sqrt()) if squares else 0.0
+                            mse_norm = grad_norm(loss)
+                            dice_norm = grad_norm(boundary_loss)
+                            if not all(math.isfinite(v) and v > 0 for v in (mse_norm, dice_norm)):
+                                raise RuntimeError("Non-finite or zero calibration gradient; no training started.")
+                            calibration_ratios.append({"mse_grad_norm": mse_norm, "dice_grad_norm": dice_norm,
+                                                       "selected": len(selected), "ratio": mse_norm / dice_norm})
+                        global_step += 1
+                        if global_step >= int(boundary_cfg.get("calibration_batches", 8)):
+                            if len(calibration_ratios) < 4:
+                                raise RuntimeError("Insufficient nonempty calibration batches; no training started.")
+                            result = {"status": "passed", "optimizer_updates": 0,
+                                      "config_sha256": file_sha256(args.config),
+                                      "gpu_name": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+                                      "batches": calibration_ratios,
+                                      "lambda": 0.1 * statistics.median(x["ratio"] for x in calibration_ratios),
+                                      "scope": "unet gradient norms before clipping; same batches; median ratio"}
+                            save_json(result, output_dir / "boundary_calibration.json")
+                            progress.close()
+                            accelerator.end_training()
+                            return
+                        continue
+                    loss = loss + boundary_weight * boundary_loss
                 gb_loss = prediction.new_zeros(())
                 edge_loss = prediction.new_zeros(())
                 structure_fraction = float((timesteps <= structure_max_t).float().mean()) if structure_max_t >= 0 else 0.0
@@ -507,6 +580,10 @@ def main() -> None:
                         "condition_drop_fraction": float(drop_mask.float().mean()),
                         **diagnostic_logs,
                     }
+                    if boundary_cfg:
+                        logs["boundary_dice_loss"] = float(boundary_loss.detach())
+                        logs["boundary_dice_selected"] = len(selected)
+                        logs["boundary_dice_lambda"] = boundary_weight
                     if descriptor_cfg:
                         logs["descriptor_valid_fraction"] = float(batch["descriptor_valid"].float().mean())
                         logs["descriptor_projection_grad_norm_after_clip"] = descriptor_grad_norm
@@ -537,6 +614,7 @@ def main() -> None:
                                 "gb_loss": logs["gb_loss"],
                                 "edge_loss": logs["edge_loss"],
                                 "structure_fraction": logs["structure_fraction"],
+                                **({key: logs[key] for key in ("boundary_dice_loss", "boundary_dice_selected", "boundary_dice_lambda")} if boundary_cfg else {}),
                                 **({"unweighted_mse": logs["unweighted_mse"]} if "unweighted_mse" in logs else {}),
                                 **diagnostic_logs,
                                 "learning_rate": logs["learning_rate"],
@@ -682,6 +760,7 @@ def main() -> None:
                     "lambda_edge": lambda_edge,
                     "structure_max_t": structure_max_t,
                 },
+                "boundary_dice": ({**boundary_cfg, "lambda": boundary_weight} if boundary_cfg else None),
                 "max_cuda_memory_gb": (
                     float(torch.cuda.max_memory_allocated() / 1024**3)
                     if torch.cuda.is_available()
