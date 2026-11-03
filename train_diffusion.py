@@ -28,7 +28,14 @@ from ebsd_diffusion.data import EbsdPatchDataset, build_condition_mapping
 from ebsd_diffusion.descriptor_conditioning import DescriptorConditionEmbedding
 from ebsd_diffusion.local_descriptors import LocalDescriptorStore
 from ebsd_diffusion.losses import diffusion_mse_loss, validate_snr_gamma
+from ebsd_diffusion.mechanics_groups import AlloyGroupBatchSampler, group_random_inputs, validate_groups
+from ebsd_diffusion.mechanics_runtime import (
+    MechanicsDataset, MechanicsRuntime, gradient_probe, validate_mechanics_config, feedback_gradient_modules,
+)
 from ebsd_diffusion.boundary_loss import boundary_dice_loss
+from ebsd_diffusion.structure_statistics import (
+    gradient_measurement, structure_statistics_loss, validate_statistics_config, x0_from_epsilon,
+)
 from ebsd_diffusion.training_diagnostics import TrainingDiagnostics
 from ebsd_diffusion.training_control import (
     file_sha256,
@@ -64,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--structure-max-t", type=int)
     parser.add_argument("--boundary-calibrate", action="store_true",
                         help="Measure boundary/MSE gradients without optimizer updates.")
+    parser.add_argument("--statistics-calibrate", action="store_true",
+                        help="Measure structure-statistics/MSE gradients without optimizer updates.")
+    parser.add_argument("--mechanics-calibrate", action="store_true",
+                        help="Measure per-target mechanics gradients without optimizer updates.")
     parser.add_argument("--software-test-cpu", action="store_true",
                         help="CPU only for synthetic software tests.")
     parser.add_argument("--benchmark-steps", type=int, default=0,
@@ -89,6 +100,8 @@ def soft_structure_descriptors(images: torch.Tensor) -> tuple[torch.Tensor, torc
 def main() -> None:
     session_started_monotonic = time.perf_counter()
     args = parse_args()
+    args.software_test_cpu = bool(getattr(args, "software_test_cpu", False))
+    args.boundary_calibrate = bool(getattr(args, "boundary_calibrate", False))
     config = load_config(args.config)
     data_cfg = config["data"]
     composition_cfg = config["composition"]
@@ -103,6 +116,41 @@ def main() -> None:
     if benchmark_steps and args.resume_from:
         raise ValueError("Benchmark must start fresh, not resume.")
     controlled = bool(train_cfg.get("controlled_experiment", False))
+    mechanics_calibrate = bool(getattr(args, "mechanics_calibrate", False))
+    mechanics_cfg = train_cfg.get("mechanics")
+    mechanics = None
+    if mechanics_calibrate and not mechanics_cfg:
+        raise ValueError("Mechanics calibration requires mechanics configuration")
+    if mechanics_cfg:
+        mechanics_cfg = validate_mechanics_config(mechanics_cfg, train_cfg, model_cfg,
+                                                  calibrate=mechanics_calibrate)
+        if args.resume_from or benchmark_steps or args.boundary_calibrate or args.statistics_calibrate:
+            raise ValueError("Mechanics requires a fresh isolated continuation/calibration")
+    statistics_cfg = train_cfg.get("structure_statistics")
+    statistics_calibrate = bool(getattr(args, "statistics_calibrate", False))
+    statistics_weight = 0.0
+    if statistics_calibrate and not statistics_cfg:
+        raise ValueError("Statistics calibration requires structure_statistics configuration")
+    if statistics_cfg:
+        statistics_cfg = validate_statistics_config(statistics_cfg)
+        if (not controlled or args.resume_from or benchmark_steps or train_cfg.get("local_descriptors")
+                or train_cfg.get("boundary_dice") or getattr(args, "boundary_calibrate", False)
+                or model_cfg["prediction_type"] != "epsilon" or train_cfg.get("snr_gamma") is not None):
+            raise ValueError("Statistics pilot requires fresh controlled epsilon/MSE continuation only")
+        if statistics_cfg["max_t"] >= int(model_cfg["num_train_timesteps"]):
+            raise ValueError("Statistics timestep gate is outside noise schedule")
+        if max(statistics_cfg["distances"]) >= int(data_cfg["patch_size"]):
+            raise ValueError("Statistics distances do not fit training patch")
+        if not statistics_calibrate:
+            path = resolve_project_path(config, statistics_cfg["calibration_file"])
+            calibration = json.loads(path.read_text("utf-8"))
+            if (calibration.get("status") != "passed" or calibration.get("optimizer_updates") != 0
+                    or calibration.get("config_sha256") != file_sha256(args.config)
+                    or calibration.get("gpu_name") != (torch.cuda.get_device_name() if torch.cuda.is_available() else None)):
+                raise ValueError("A matching zero-update statistics calibration is required")
+            statistics_weight = float(calibration["lambda"])
+            if not math.isfinite(statistics_weight) or statistics_weight <= 0:
+                raise ValueError("Invalid calibrated statistics weight")
     boundary_cfg = train_cfg.get("boundary_dice")
     if args.boundary_calibrate and not boundary_cfg:
         raise ValueError("Boundary calibration requires boundary_dice configuration.")
@@ -189,8 +237,19 @@ def main() -> None:
     if controlled and (lambda_gb != 0.0 or lambda_edge != 0.0):
         raise ValueError("The matched Min-SNR pilot requires both structure loss weights to be zero.")
     loop_steps = (int(boundary_cfg.get("calibration_batches", 8)) if args.boundary_calibrate
+                  else int(statistics_cfg["calibration_batches"]) if statistics_calibrate
+                  else mechanics_cfg["calibration_batches"] if mechanics_calibrate
                   else benchmark_steps or int(train_cfg["max_steps"]))
     initialization, initialization_report = resolve_initialization(config)
+    if mechanics_cfg:
+        mechanics = MechanicsRuntime(config, mechanics_cfg, initialization_report,
+                                     calibrate=mechanics_calibrate)
+    if statistics_cfg and initialization is None:
+        raise ValueError("Statistics pilot must start from an explicit mature checkpoint")
+    source_effective_step = initialization_report["source_global_step"] if initialization_report else 0
+    if train_cfg.get("track_source_effective_step") and initialization:
+        source_state = json.loads(initialization["run_metadata"].read_text("utf-8"))
+        source_effective_step = int(source_state.get("effective_total_step", source_state["global_step"]))
 
     output_dir = args.output_dir.resolve() if args.output_dir else resolve_project_path(config, train_cfg["output_dir"])
     if controlled and output_dir.exists() and any(output_dir.iterdir()):
@@ -254,21 +313,32 @@ def main() -> None:
         rotate_180=bool(data_cfg["rotate_180"]),
         descriptor_store=descriptor_store,
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=int(train_cfg["batch_size"]),
-        shuffle=True,
-        num_workers=int(data_cfg["num_workers"]),
-        pin_memory=True,
-        drop_last=True,
-        persistent_workers=int(data_cfg["num_workers"]) > 0,
-    )
+    group_sampler = None
+    loader_options = dict(num_workers=int(data_cfg["num_workers"]), pin_memory=True,
+                          persistent_workers=int(data_cfg["num_workers"]) > 0)
+    if mechanics:
+        labels_path = resolve_project_path(config, mechanics_cfg['labels_file'])
+        mechanics.bind_data(dataset, labels_path)
+        if not mechanics.is_cnn and mechanics.proxy.composition_names != conditioner.active_features:
+            raise ValueError("Proxy composition columns must match the source active_features")
+        dataset = MechanicsDataset(dataset, compositions, labels_path,
+                                    mechanics.proxy.composition_names, mechanics.active)
+        group_sampler = AlloyGroupBatchSampler(dataset, int(train_cfg['batch_size']),
+                                               mechanics_cfg['group_size'], config['seed'])
+        loader = DataLoader(dataset, batch_sampler=group_sampler, **loader_options)
+    else:
+        loader = DataLoader(dataset, batch_size=int(train_cfg['batch_size']), shuffle=True,
+                            drop_last=True, **loader_options)
     if not len(loader):
         raise ValueError("Dataset cannot supply a complete batch; reduce batch_size.")
 
     vae_dir = args.vae_dir or resolve_project_path(config, train_cfg["vae_dir"])
     vae = AutoencoderKL.from_pretrained(vae_dir)
     vae.requires_grad_(False).eval().to(accelerator.device)
+    if mechanics:
+        mechanics.bind_vae(Path(vae_dir))
+        vae.float()
+        mechanics.proxy.to(accelerator.device).float()
     vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
     latent_size = int(data_cfg["patch_size"]) // vae_scale_factor
 
@@ -392,6 +462,8 @@ def main() -> None:
     diagnostics = TrainingDiagnostics(noise_scheduler.config.num_train_timesteps) if controlled and not benchmark_steps else None
     while global_step < loop_steps:
         torch.manual_seed(int(config["seed"]) + epoch)
+        if group_sampler is not None:
+            group_sampler.set_epoch(epoch)
         for batch in loader:
             with accelerator.accumulate(unet, condition_encoder):
                 images = batch["pixel_values"]
@@ -402,20 +474,20 @@ def main() -> None:
                     ) * latent_scaling
 
                 noise = torch.randn_like(latents)
-                timesteps = torch.randint(
-                    0,
-                    noise_scheduler.config.num_train_timesteps,
-                    (latents.shape[0],),
-                    device=latents.device,
-                    dtype=torch.long,
-                )
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
                 jitter_std = float(composition_cfg["vicinal_jitter_std"])
-                vicinal_condition = conditions + torch.randn_like(conditions) * jitter_std
-                drop_mask = torch.rand(conditions.shape[0], device=conditions.device) < float(
-                    model_cfg["condition_dropout"]
-                )
+                if mechanics:
+                    validate_groups(batch['alloy_id'], conditions, mechanics_cfg['group_size'])
+                    timesteps, vicinal_condition, drop_mask = group_random_inputs(
+                        conditions, mechanics_cfg['group_size'], noise_scheduler.config.num_train_timesteps,
+                        jitter_std, float(model_cfg['condition_dropout']))
+                else:
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],),
+                        device=latents.device, dtype=torch.long)
+                    vicinal_condition = conditions + torch.randn_like(conditions) * jitter_std
+                    drop_mask = torch.rand(conditions.shape[0], device=conditions.device) < float(
+                        model_cfg["condition_dropout"])
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 if descriptor_cfg:
                     class_embedding = condition_encoder(
                         vicinal_condition, drop_mask=drop_mask,
@@ -475,6 +547,80 @@ def main() -> None:
                     snr_gamma=snr_gamma,
                     prediction_type=noise_scheduler.config.prediction_type,
                 )
+                mechanics_logs = {}
+                if mechanics:
+                    auxiliary, terms, info = mechanics.loss(
+                        vae, noisy_latents, prediction, timesteps, drop_mask, batch,
+                        noise_scheduler.alphas_cumprod, latent_scaling)
+                    mechanics_logs = {"mechanics_"+key: value if value is not None else float('nan')
+                                      for key, value in info.items()}
+                    mechanics_logs.update(mechanics_loss=float(auxiliary.detach()),
+                        mechanics_peak_loss=float(terms[0].detach()),
+                        mechanics_strain_loss=float(terms[1].detach()), mechanics_lambda=mechanics.weight)
+                    if mechanics_calibrate or (global_step+1) % int(train_cfg['log_every']) == 0:
+                        record = gradient_probe(loss, terms, auxiliary, feedback_gradient_modules(
+                            accelerator.unwrap_model(unet), accelerator.unwrap_model(condition_encoder)))
+                        record.update(step=global_step+1, **info)
+                        if mechanics_calibrate:
+                            mechanics.records.append(record)
+                        else:
+                            append_csv_row(output_dir/'mechanics_gradients.csv',
+                                {key: json.dumps(value) if isinstance(value, dict) else value
+                                 for key, value in record.items()})
+                    if mechanics_calibrate:
+                        global_step += 1
+                        progress.update(1)
+                        if global_step >= loop_steps:
+                            save_json(mechanics.calibration_result(), output_dir/'mechanics_calibration.json')
+                            progress.close()
+                            accelerator.end_training()
+                            return
+                        continue
+                    loss = loss + mechanics.weight * auxiliary
+                statistics_loss = prediction.new_zeros(())
+                statistics_logs = {}
+                if statistics_cfg:
+                    stat_selected = torch.nonzero(timesteps <= statistics_cfg["max_t"], as_tuple=True)[0][:statistics_cfg["max_samples"]]
+                    statistics_logs = {"statistics_" + k: 0.0 for k in (
+                        "density_loss", "correlation_loss", "pred_density", "target_density",
+                        "mse_grad_norm", "statistics_grad_norm", "gradient_cosine", "ratio", "weighted_grad_ratio")}
+                    statistics_logs.update(statistics_selected=len(stat_selected), statistics_lambda=statistics_weight,
+                                           statistics_gradient_measured=0)
+                    if len(stat_selected):
+                        stat_x0 = x0_from_epsilon(noisy_latents[stat_selected], prediction[stat_selected],
+                                                 timesteps[stat_selected], noise_scheduler.alphas_cumprod)
+                        stat_decoded = vae.decode(stat_x0 / latent_scaling).sample
+                        statistics_loss, components = structure_statistics_loss(
+                            stat_decoded, images[stat_selected], **{k: statistics_cfg[k] for k in
+                            ("distances", "threshold", "temperature", "density_floor")})
+                        statistics_logs.update({"statistics_" + k: float(v.detach()) for k, v in components.items()})
+                        if statistics_calibrate or (global_step + 1) % int(train_cfg["log_every"]) == 0:
+                            measurement = gradient_measurement(loss, statistics_loss,
+                                accelerator.unwrap_model(unet).parameters())
+                            statistics_logs.update({"statistics_" + k: v for k, v in measurement.items()})
+                            statistics_logs["statistics_gradient_measured"] = 1
+                            statistics_logs["statistics_weighted_grad_ratio"] = statistics_weight / measurement["ratio"]
+                            if statistics_calibrate:
+                                calibration_ratios.append({**measurement, "selected": len(stat_selected),
+                                    "timesteps": timesteps[stat_selected].detach().cpu().tolist()})
+                    statistics_logs["statistics_loss"] = float(statistics_loss.detach())
+                    if statistics_calibrate:
+                        global_step += 1
+                        if global_step >= loop_steps:
+                            if len(calibration_ratios) < 4:
+                                raise RuntimeError("Insufficient nonempty statistics calibration batches")
+                            save_json({"status": "passed", "optimizer_updates": 0,
+                                "config_sha256": file_sha256(args.config),
+                                "gpu_name": torch.cuda.get_device_name() if torch.cuda.is_available() else None,
+                                "batches": calibration_ratios,
+                                "lambda": statistics_cfg["gradient_ratio"] * statistics.median(x["ratio"] for x in calibration_ratios),
+                                "scope": "mature source U-Net gradient norms before clipping; fixed low-noise gate"},
+                                output_dir / "statistics_calibration.json")
+                            progress.close()
+                            accelerator.end_training()
+                            return
+                        continue
+                    loss = loss + statistics_weight * statistics_loss
                 boundary_loss = prediction.new_zeros(())
                 if boundary_cfg:
                     selected = torch.nonzero(timesteps <= boundary_cfg["max_t"], as_tuple=True)[0][:boundary_cfg["max_samples"]]
@@ -579,6 +725,8 @@ def main() -> None:
                         "latent_scaling": latent_scaling,
                         "condition_drop_fraction": float(drop_mask.float().mean()),
                         **diagnostic_logs,
+                        **statistics_logs,
+                        **mechanics_logs,
                     }
                     if boundary_cfg:
                         logs["boundary_dice_loss"] = float(boundary_loss.detach())
@@ -614,6 +762,7 @@ def main() -> None:
                                 "gb_loss": logs["gb_loss"],
                                 "edge_loss": logs["edge_loss"],
                                 "structure_fraction": logs["structure_fraction"],
+                                **statistics_logs,
                                 **({key: logs[key] for key in ("boundary_dice_loss", "boundary_dice_selected", "boundary_dice_lambda")} if boundary_cfg else {}),
                                 **({"unweighted_mse": logs["unweighted_mse"]} if "unweighted_mse" in logs else {}),
                                 **diagnostic_logs,
@@ -739,7 +888,7 @@ def main() -> None:
             {
                 "global_step": global_step,
                 "source_global_step": initialization_report["source_global_step"] if initialization_report else 0,
-                "effective_total_step": global_step + (initialization_report["source_global_step"] if initialization_report else 0),
+                "effective_total_step": global_step + source_effective_step,
                 "initialization": initialization_report,
                 "snr_gamma": snr_gamma,
                 "local_descriptors": descriptor_cfg,
@@ -761,6 +910,10 @@ def main() -> None:
                     "structure_max_t": structure_max_t,
                 },
                 "boundary_dice": ({**boundary_cfg, "lambda": boundary_weight} if boundary_cfg else None),
+                "structure_statistics": ({**statistics_cfg, "lambda": statistics_weight} if statistics_cfg else None),
+                "mechanics": ({**mechanics_cfg, 'lambda': mechanics.weight,
+                               'decision_sha256': mechanics.decision_sha,
+                               'proxy_sha256': file_sha256(mechanics.proxy_path)} if mechanics else None),
                 "max_cuda_memory_gb": (
                     float(torch.cuda.max_memory_allocated() / 1024**3)
                     if torch.cuda.is_available()

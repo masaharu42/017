@@ -1,0 +1,24 @@
+# Third development round: pure image CNN. No generator updates.
+mechanics_cnn:
+  extraction: output/mechanics_m0/extraction
+  manifest: data/manifest.csv
+  labels: 09_力学试验数据_只读整理_20261029/tables_from_windows/alloy_median_9_mechanics_targets.csv
+  output_root: output/mechanics_cnn_v1
+  exclude_alloy_id: 3
+  expected_alloys: 21
+  software_fixture: false
+  patch_size: 256
+  seeds: [20261103, 20261104, 20261105]
+  inner_folds: 4
+  max_epochs: 200
+  groups_per_epoch: 128
+  batch_groups: 8
+  group_size: 4
+  learning_rate: 0.001
+  # Exploratory prediction screen, fixed before reading CNN results; not physical validation.
+  prediction_screen:
+    minimum_ensemble_r2: 0.5
+    minimum_improved_alloys: 12
+    require_each_seed_positive_r2: true
+  # Crop only; no unverified IPF colour or coordinate transformations.
+  device: cuda

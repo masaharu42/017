@@ -1,0 +1,11 @@
+# Copy to sample_mechanics_s0.local.yaml and verify every server path/hash.
+# S0 is the pure-MSE 65k RAW final; the paired EMA export must not be used.
+raw_unet: 08_训练与生成结果/14_Fold03_MSE_结构统计_5k_运行/A_mse/final/unet_raw/diffusion_pytorch_model.safetensors
+unet_config: 08_训练与生成结果/14_Fold03_MSE_结构统计_5k_运行/A_mse/final/unet_raw
+condition_encoder_dir: 08_训练与生成结果/14_Fold03_MSE_结构统计_5k_运行/A_mse/final/condition_encoder
+condition_encoder_weights: 08_训练与生成结果/14_Fold03_MSE_结构统计_5k_运行/A_mse/final/condition_encoder/pytorch_model.bin
+conditioner: 08_训练与生成结果/14_Fold03_MSE_结构统计_5k_运行/A_mse/final/composition_conditioner.json
+scheduler_dir: 08_训练与生成结果/14_Fold03_MSE_结构统计_5k_运行/A_mse/final/scheduler
+run_metadata: 08_训练与生成结果/14_Fold03_MSE_结构统计_5k_运行/A_mse/final/run_metadata.json
+# Exact baseline VAE location from the recovered 65k run metadata.
+vae_dir: 01_基线留一验证_同一配置/00_基线模型/VAE模型/final

@@ -11,3 +11,14 @@ __pycache__/
 
 # Per-run copies stay directly in configs/ to preserve project-root resolution.
 /configs/*.local.yaml
+
+# Local experiment outputs and manually unpacked server sync bundles.
+/output/
+/logs/
+/.sync_backups/
+/mechanics_m0*_sync_*/
+/structure_statistics_sync_*/
+/*_sync_*.tar.gz
+/*_sync_*.tar.gz.sha256
+/.mechanics_m0_v2_config
+/.mechanics_m0_v2_log

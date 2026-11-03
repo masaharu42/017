@@ -16,6 +16,10 @@ class MechanicsSurrogate(nn.Module):
                                      nn.Linear(hidden, hidden), nn.SiLU(),
                                      nn.Linear(hidden, output_dim))
 
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        """Legacy MLP interface; the reviewed protocol uses LinearMechanics instead."""
+        return self.network(features)
+
     def freeze(self) -> 'MechanicsSurrogate':
         self.eval()
         for parameter in self.parameters():

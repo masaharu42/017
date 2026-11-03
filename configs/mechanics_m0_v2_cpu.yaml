@@ -1,0 +1,36 @@
+# Second-round development after seeing v1. No generator/GPU work.
+mechanics_m0_v2:
+  extraction: output/mechanics_m0/extraction
+  output_root: output/mechanics_m0_v2_cpu
+  manifest: data/manifest.csv
+  compositions: data/compositions.csv
+  labels: 09_力学试验数据_只读整理_20261029/tables_from_windows/alloy_median_9_mechanics_targets.csv
+  trials: 09_力学试验数据_只读整理_20261029/tables_from_windows/ncorr_trial_9_mechanics_targets.csv
+  terminal_reasons: null
+  server_manifest: null
+  server_compositions: null
+  exclude_alloy_id: 3
+  expected_training_alloys: 21
+  software_fixture: false
+  seed: 20261102
+  permutations: 1000
+  permutation_p_threshold: 0.05
+  bootstrap_count: 1000
+  alphas: [0.001, 0.01, 0.1, 1.0, 10.0, 100.0, 1000.0]
+  image_penalty_ratios: [1.0, 3.0, 10.0, 30.0, "off"]
+  soft_modes: [shared, block_pc1, block_all, image_only]
+  hard_variants: [hard_base4]
+  # Optional second representation only: [hard_base4, hard_layout5]. Lock before running.
+  correlation_threshold: 0.9
+  max_hard_features: 3
+  min_valid_window_fraction: 0.9
+  additional_non_degradation: true
+  hard_settings:
+    black_threshold: 51
+    boundary_dilation_px: 1
+    min_region_area_px: 10
+    coarse_diameter_px: 20.0
+    min_regions: 3
+  spatial_block: 64
+  base_priority: [log_area_weighted_diameter_px, coarse_area_fraction, area_weighted_aspect, log_region_density_per_px2]
+  layout_priority: [log_area_weighted_diameter_px, centroid_density_cv, coarse_area_fraction, area_weighted_aspect, log_region_density_per_px2]
