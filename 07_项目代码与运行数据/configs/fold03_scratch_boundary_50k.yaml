@@ -1,0 +1,8 @@
+name: fold03_scratch_boundary_50k_batch32
+baseline_run: 08_训练与生成结果/06_Fold03_raw50k_MSE_MinSNR5_10k_运行
+output_root: 08_训练与生成结果/12_Fold03_scratch_boundary_50k_运行
+expected_source_step: 50000
+expected_additional_steps: 10000
+evaluation:
+  alloy_ids: [5, 7, 20]
+  seeds: [20261012, 20261013]

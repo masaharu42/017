@@ -1,0 +1,14 @@
+# Read-only / proxy-fitting phases only. Generator weights are never updated.
+mechanics_m0:
+  manifest: data/manifest.csv
+  compositions: data/compositions.csv
+  labels: 09_力学试验数据_只读整理_20261029/tables_from_windows/alloy_median_9_mechanics_targets.csv
+  source_conditioner: 08_训练与生成结果/14_Fold03_MSE_结构统计_5k_运行/A_mse/final/composition_conditioner.json
+  exclude_alloy_id: 3
+  patch_size: 256
+  windows_per_alloy: 32
+  seed: 20261102
+  feature_settings:
+    threshold: 0.20
+    temperature: 0.05
+    lag: 32

@@ -1,0 +1,38 @@
+name: fold03_reviewed_A_mse_vs_structure_statistics_5k
+source_sampling_config: configs/sample_a_raw_id03_neighbors.yaml
+historical_hparams: configs/fold03_raw50k_hparams.yaml
+baseline_run: 08_训练与生成结果/06_Fold03_raw50k_MSE_MinSNR5_10k_运行
+output_root: 08_训练与生成结果/14_Fold03_MSE_结构统计_5k_运行
+# Old baseline provenance: original50k + MSE10k, historically called A_raw50k.
+expected_source_step: 50000
+expected_additional_steps: 10000
+expected_baseline_effective_step: 60000
+expected_baseline_sha256:
+  raw_unet: 9c0fae824a4fcd4ad75ed3b1d94940b7f28f48a78e3a484c84af191a21ef7af6
+  condition_encoder_weights: cc79db3442572715b5d39683c321613433d9439b3042342fa82553bb70265019
+exclude_alloy_id: 3
+require_cuda: true
+training:
+  seed: 20261031
+  additional_steps: 5000
+  learning_rate: 3.0e-5
+  warmup_steps: 250
+  save_every: 1000
+  log_every: 25
+structure_statistics:
+  distances: [1, 2, 4, 8, 16, 32, 64]
+  threshold: 0.20
+  temperature: 0.05
+  density_floor: 0.02
+  max_t: 300
+  max_samples: 8
+  calibration_batches: 8
+  gradient_ratio: 0.10
+evaluation:
+  alloy_ids: [14, 15, 19, 20, 5, 7]
+  seeds: [20261012, 20261013, 20261014, 20261015, 20261016]
+  height: 256
+  width: 256
+  steps: 50
+  guidance_scale: 1.8
+  gb_threshold: 0.18

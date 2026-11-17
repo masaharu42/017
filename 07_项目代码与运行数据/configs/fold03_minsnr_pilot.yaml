@@ -1,0 +1,26 @@
+# One paired experiment. Prepare on the actual training machine before training.
+name: fold03_raw50k_minsnr_gamma5_pilot
+source_sampling_config: configs/sample_a_raw_id03_neighbors.yaml
+historical_hparams: configs/fold03_raw50k_hparams.yaml
+output_root: 08_训练与生成结果/04_Fold03_MinSNR配对试验
+exclude_alloy_id: 3
+expected_source_step: 50000
+require_cuda: true
+training:
+  seed: 20260721
+  additional_steps: 5000
+  learning_rate: 1.0e-5
+  warmup_steps: 100
+  save_every: 1000
+  log_every: 25
+  deterministic: true
+  # batch32, workers4, fp16, patch256 and augmentations come from logged hparams.
+evaluation:
+  alloy_ids: [5, 7, 20, 3]
+  seeds: [20261012, 20261013, 20261014, 20261015, 20261016]
+  steps: 50
+  guidance_scale: 1.8
+  height: 256
+  width: 256
+  gb_threshold: 0.18
+  sampling_dtype: float16

@@ -1,0 +1,80 @@
+# RTX 4080 SUPER 32 GB server preset.
+# Start with these values; reduce only the corresponding batch_size if CUDA OOM occurs.
+seed: 20260721
+
+data:
+  manifest: data/manifest.csv
+  compositions: data/compositions.csv
+  heat_treatment: data/heat_treatment.csv
+  patch_size: 256
+  patches_per_image: 128
+  crop_margins: [0, 0, 0, 0]
+  horizontal_flip: false
+  vertical_flip: false
+  rotate_180: false
+  num_workers: 4
+
+composition:
+  candidate_features: [Ni, Fe, Cr, Nb, Ta, Co, Mo, Al, Ti]
+  closure_drop_feature: Fe
+  min_nonzero_samples: 2
+  min_standard_deviation: 1.0e-8
+  vicinal_jitter_std: 0.05
+  max_normalized_extrapolation: 3.0
+
+vae:
+  latent_channels: 4
+  block_out_channels: [64, 128, 256]
+  layers_per_block: 2
+  kl_weight: 1.0e-6
+  edge_weight: 0.20
+
+diffusion:
+  block_out_channels: [128, 256, 256]
+  layers_per_block: 2
+  condition_hidden_dim: 128
+  condition_dropout: 0.15
+  num_train_timesteps: 1000
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+  ema_decay: 0.9999
+
+train_vae:
+  output_dir: 08_训练与生成结果/03_256空间匹配实验/VAE
+  batch_size: 24
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  max_steps: 30000
+  mixed_precision: fp16
+  gradient_checkpointing: false
+  save_every: 2500
+  log_every: 25
+
+train_diffusion:
+  output_dir: 08_训练与生成结果/03_256空间匹配实验/diffusion
+  vae_dir: 08_训练与生成结果/03_256空间匹配实验/VAE/final
+  batch_size: 32
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+  max_steps: 50000
+  mixed_precision: fp16
+  gradient_checkpointing: true
+  save_every: 5000
+  sample_every: 2500
+  log_every: 25
+
+sampling:
+  preview_count: 8
+  final_count_per_alloy: 32
+  num_inference_steps: 50
+  guidance_scale: 1.8
+  height: 256
+  width: 256
+  crop_height: 256
+  crop_width: 256
+
+

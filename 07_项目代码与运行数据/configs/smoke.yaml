@@ -1,0 +1,74 @@
+seed: 20260721
+
+data:
+  manifest: data/manifest.csv
+  compositions: data/compositions.csv
+  patch_size: 64
+  patches_per_image: 2
+  crop_margins: [0, 0, 0, 0]
+  horizontal_flip: false
+  vertical_flip: false
+  rotate_180: false
+  num_workers: 0
+
+composition:
+  candidate_features: [Ni, Fe, Cr, Nb, Ta, Co, Mo, Al, Ti]
+  closure_drop_feature: Fe
+  min_nonzero_samples: 2
+  min_standard_deviation: 1.0e-8
+  vicinal_jitter_std: 0.05
+  max_normalized_extrapolation: 3.0
+
+vae:
+  latent_channels: 4
+  block_out_channels: [32, 64]
+  layers_per_block: 1
+  kl_weight: 1.0e-6
+  edge_weight: 0.20
+
+diffusion:
+  block_out_channels: [32, 64]
+  layers_per_block: 1
+  condition_hidden_dim: 32
+  condition_dropout: 0.15
+  num_train_timesteps: 20
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+  ema_decay: 0.99
+
+train_vae:
+  output_dir: 08_训练与生成结果/00_程序检查/vae
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 0
+  max_steps: 1
+  mixed_precision: fp16
+  gradient_checkpointing: false
+  save_every: 100
+  log_every: 1
+
+train_diffusion:
+  output_dir: 08_训练与生成结果/00_程序检查/diffusion
+  vae_dir: 08_训练与生成结果/00_程序检查/vae/final
+  batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 0
+  max_steps: 1
+  mixed_precision: fp16
+  gradient_checkpointing: false
+  save_every: 100
+  sample_every: 100
+  log_every: 1
+
+sampling:
+  num_inference_steps: 2
+  guidance_scale: 1.5
+  height: 64
+  width: 64
+  crop_height: 64
+  crop_width: 64
+

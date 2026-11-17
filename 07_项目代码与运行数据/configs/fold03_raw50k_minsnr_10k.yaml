@@ -1,0 +1,37 @@
+# Separate experiment; never replace the historical 5k or Stage A protocols.
+name: fold03_raw50k_mse_vs_minsnr5_10k
+source_sampling_config: configs/sample_a_raw_id03_neighbors.yaml
+historical_hparams: configs/fold03_raw50k_hparams.yaml
+# null = this checkout. In a *.local.yaml copy, set the server archive root
+# containing data/, 01_基线留一验证_同一配置/, and 02_256空间匹配实验/.
+data_root: null
+output_root: 08_训练与生成结果/06_Fold03_raw50k_MSE_MinSNR5_10k_运行
+exclude_alloy_id: 3
+expected_source_step: 50000
+expected_latent_scaling: 1.0069132457274694
+expected_source_sha256:
+  raw_unet: e93db42e7d3a645bfa238121e762e64f10e22266d5ebd56881e500acd1c6a2a0
+  condition_encoder_weights: 15032016093568b06b3fbfc3539ec1abf7a7b278cb9334fa5147c409f92b779b
+expected_vae_sha256:
+  diffusion_pytorch_model.safetensors: ebd4b4a3747d7bb6e94c55aac398dc9b14dfc407f5fd5b1c8ab5f921eae1abcf
+require_cuda: true
+training:
+  seed: 20260721
+  additional_steps: 10000
+  learning_rate: 3.0e-5
+  warmup_steps: 500
+  save_every: 2000
+  log_every: 25
+  deterministic: true
+  require_diagnostics: true
+  # Keep batch32 / accumulation1 / FP16 / checkpointing / workers4 from hparams.
+evaluation:
+  alloy_ids: [5, 7, 20]
+  heldout_alloy_ids: [3]
+  seeds: [20261012, 20261013, 20261014, 20261015, 20261016]
+  steps: 50
+  guidance_scale: 1.8
+  height: 256
+  width: 256
+  gb_threshold: 0.18
+  sampling_dtype: float16

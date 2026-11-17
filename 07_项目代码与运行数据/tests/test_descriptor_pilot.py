@@ -1,0 +1,180 @@
+import json
+from pathlib import Path
+import subprocess
+import sys
+from types import SimpleNamespace
+
+from PIL import Image
+import pytest
+import yaml
+import torch
+
+from test_minsnr_ablation import tiny_protocol
+from test_local_descriptors import grid
+from scripts import run_descriptor_pilot as local
+from scripts import run_minsnr_ablation as old
+
+
+def test_large_vram_only_changes_execution_and_guards_memory(monkeypatch):
+    p, _ = local.read_protocol(local.ROOT / 'configs/fold03_local5_10k_large_vram.yaml')
+    config = {'data': {'num_workers': 4}, 'train_diffusion': {'batch_size': 32,
+        'mixed_precision': 'fp16', 'gradient_checkpointing': True, 'max_steps': 10000}}
+    changed = local.execution_config(config, p)
+    assert config['train_diffusion']['gradient_checkpointing'] is True
+    assert changed['train_diffusion']['gradient_checkpointing'] is False
+    assert changed['train_diffusion']['batch_size'] == 32
+    assert changed['train_diffusion']['mixed_precision'] == 'fp16'
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    with pytest.raises(RuntimeError, match='server CUDA'):
+        local.device_profile(p)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    monkeypatch.setattr(torch.cuda, 'get_device_properties', lambda device: SimpleNamespace(name='synthetic-GPU'))
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda device: (12, 0))
+    monkeypatch.setattr(torch.cuda, 'get_arch_list', lambda: ['sm_120'])
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda device: (40 * 1024**3, 96 * 1024**3))
+    with pytest.raises(RuntimeError, match='min_free_vram_gib'):
+        local.device_profile(p)
+    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda device: (84 * 1024**3, 96 * 1024**3))
+    original_ones = torch.ones
+    monkeypatch.setattr(torch, 'ones', lambda shape, **kw: original_ones(shape, dtype=kw['dtype']))
+    before = torch.get_rng_state()
+    report = local.device_profile(p)
+    assert report['total_vram_gib'] == 96 and report['free_vram_gib'] == 84
+    assert report['fp16_kernel_check'] == 'passed'
+    assert torch.equal(before, torch.get_rng_state())
+
+
+@pytest.mark.parametrize("paired", [False, True, "restart", "cross"])
+def test_reuse_control_end_to_end_and_stop_on_tampering(tiny_protocol, tmp_path, monkeypatch, paired):
+    """Two optimizer steps of tiny synthetic CPU models; no scientific run/data."""
+    monkeypatch.setenv('ACCELERATE_USE_CPU', 'true')
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '-1')
+    monkeypatch.setenv('OMP_NUM_THREADS', '1')
+    monkeypatch.setenv('MKL_NUM_THREADS', '1')
+    path, protocol = tiny_protocol
+    protocol['evaluation']['alloy_ids'] = [1, 2]
+    path.write_text(yaml.safe_dump(protocol))
+    for i in (1, 2, 3):
+        Image.fromarray(grid()).save(tmp_path / 'source' / f'real_{i}.png')
+    old.prepare(path)
+    old.train(path)
+    old.evaluate(path)
+    p = {'name': 'synthetic_local5_only', 'baseline_run': protocol['output_root'],
+        'output_root': str(tmp_path / 'local_run'), 'expected_source_step': 50000,
+        'expected_additional_steps': 2, 'require_cuda': False, 'software_test_only': True,
+        'descriptor_hidden_dim': 32, 'uncertainty_inputs': False, 'normalizer_windows_per_alloy': 16,
+        'descriptor_settings': {'min_region_area_px': 1, 'boundary_dilation_px': 0,
+                                'coarse_diameter_px': 3.},
+        'evaluation': {**protocol['evaluation'], 'target_quantiles': [.1,.5,.9]}}
+    if paired:
+        p["comparison_mode"] = "fresh_pair"
+    pp = tmp_path / 'local.yaml'; pp.write_text(yaml.safe_dump(p))
+    bad_protocol = tmp_path / 'uncertainty.yaml'
+    bad_protocol.write_text(yaml.safe_dump({**p, 'uncertainty_inputs': True}))
+    with pytest.raises(ValueError, match='excludes uncertainty'):
+        local.read_protocol(bad_protocol)
+    manifest = local.prepare(pp)
+    assert manifest['status'] == 'prepared_not_trained'
+    root = Path(p['output_root'])
+    meta = json.loads((root / 'labels/metadata.json').read_text())
+    assert meta['training_alloy_ids'] == [1, 2]
+    assert {r['alloy_id'] for r in meta['images']} == {1, 2}
+    with pytest.raises(FileExistsError):
+        local.prepare(pp)
+    if paired in ("restart", "cross"):
+        original_train_arm = local.train_arm
+        def interrupt_B(output, root, name, config):
+            if name == "B_local5":
+                (output / name).mkdir()
+                (output / name / "interrupted.txt").write_text("synthetic interruption")
+                raise RuntimeError("synthetic interrupted B")
+            return original_train_arm(output, root, name, config)
+        monkeypatch.setattr(local, "train_arm", interrupt_B)
+        with pytest.raises(RuntimeError, match="synthetic interrupted B"):
+            local.train(pp)
+        monkeypatch.setattr(local, "train_arm", original_train_arm)
+        if paired == "restart":
+            from scripts import restart_local5 as restart_module
+            monkeypatch.setattr(restart_module, "device_profile", lambda protocol: {
+                "gpu_name": "synthetic changed device", "total_vram_gib": 96})
+            restart = restart_module.restart
+            with pytest.raises(ValueError, match="Device changed"):
+                restart(pp)
+            with pytest.raises(FileExistsError):
+                restart(pp, accept_device_change=True)
+            result = restart(pp, archive_failed=True, accept_device_change=True)
+            assert result["new_training_arms"] == ["B_local5"]
+            assert len(list(root.glob("B_local5_interrupted_*"))) == 1
+        else:
+            # Simulate GPU-dependent historical hashes while keeping the
+            # actual A weights/data fixed; the new policy must report this.
+            from scripts.run_local5_cross_device import prepare, train
+            fingerprint_path = root / "A_mse/input_fingerprints.csv"
+            lines = fingerprint_path.read_text().splitlines()
+            fingerprint_path.write_text(lines[0] + "\n" + "\n".join(
+                line.split(",")[0] + ",foreign_gpu_tensor_hash" for line in lines[1:]) + "\n")
+            record_path = root / "experiment_manifest.json"
+            record = json.loads(record_path.read_text())
+            from ebsd_diffusion.training_control import file_sha256
+            record["control_artifact_sha256"][str(fingerprint_path)] = file_sha256(fingerprint_path)
+            record_path.write_text(json.dumps(record))
+            original_A_hash = file_sha256(root / "A_mse/final/unet_raw/diffusion_pytorch_model.safetensors")
+            pp = prepare(pp)
+            result = train(pp)
+            root = pp.parent.parent
+            manifest = json.loads((root / "experiment_manifest.json").read_text())
+            assert (root / "A_mse").is_symlink()
+            assert file_sha256(root / "A_mse/final/unet_raw/diffusion_pytorch_model.safetensors") == original_A_hash
+            assert result["new_training_arms"] == ["B_local5"]
+    else:
+        result = local.train(pp)
+        assert result['new_training_arms'] == (['A_mse', 'B_local5'] if paired else ['B_local5'])
+    verified = json.loads((root / 'B_local5/matched_baseline_inputs.json').read_text())
+    assert verified['status'] == ('completed_cross_device_screening' if paired == 'cross' else 'passed')
+    assert verified['checked_steps'] == [1, 2]
+    if paired == 'cross':
+        assert verified['historical_mismatch_steps'] == [1, 2]
+    normalizer = json.loads((root / 'B_local5/final/condition_encoder/descriptor_normalizer.json').read_text())
+    assert normalizer['training_alloy_ids'] == [1, 2]
+    report = local.evaluate(pp)
+    assert report['new_samples'] == (16 if paired else 12)
+    assert report['reused_control_images'] == (0 if paired else 4)
+    assert (root / 'A_mse').exists() == bool(paired)
+    if paired:
+        if paired != 'cross':
+            assert (root / 'A_mse/input_fingerprints.csv').read_bytes() == (root / 'B_local5/input_fingerprints.csv').read_bytes()
+        assert report['new_control_images'] == 4
+        local.verify_control(json.loads((root / 'experiment_manifest.json').read_text()))
+        control_fingerprints = root / 'A_mse/input_fingerprints.csv'
+        original = control_fingerprints.read_bytes()
+        control_fingerprints.write_bytes(original + b'\n')
+        with pytest.raises(ValueError, match='Fresh control changed'):
+            local.verify_control(json.loads((root / 'experiment_manifest.json').read_text()))
+        control_fingerprints.write_bytes(original)
+    assert not (root / 'evaluation/alloy_03').exists()
+    assert (root / 'evaluation/paired_descriptor_errors.csv').is_file()
+    from scripts.audit_descriptor_inputs import audit
+    replay = audit(pp)
+    assert replay['optimizer_updates'] == 0
+    assert replay['archived_replay_matches_history']
+    assert replay['new_code_matches_archived_replay_here']
+    assert all(replay['components_equal_here'].values())
+    # A changed reference stream must fail BEFORE the first optimizer update,
+    # rather than merely warning after a paid server run.
+    config = yaml.safe_load(Path(manifest['config']).read_text())
+    bad_reference = tmp_path / 'wrong_fingerprints.csv'
+    bad_reference.write_text('additional_step,sha256\n1,wrong\n2,wrong\n')
+    config['train_diffusion']['output_dir'] = str(tmp_path / 'must_stop')
+    config['train_diffusion']['local_descriptors']['reference_fingerprints'] = str(bad_reference)
+    config['train_diffusion']['local_descriptors']['input_comparison_policy'] = 'strict_tensor_identity'
+    bad_config = tmp_path / 'bad_config.yaml'; bad_config.write_text(yaml.safe_dump(config))
+    failed = subprocess.run([sys.executable, str(local.ROOT / 'train_diffusion.py'), '--config',
+        str(bad_config), '--exclude-alloy-id', '3'], capture_output=True, text=True)
+    assert failed.returncode != 0 and 'Baseline input mismatch at step 1' in failed.stderr
+    assert not (tmp_path / 'must_stop/final').exists()
+    with pytest.raises(ValueError, match='Complete training'):
+        local.evaluate(pp)
+    metadata = root / 'labels/metadata.json'; metadata.write_text(metadata.read_text() + '\n')
+    with pytest.raises(ValueError, match='changed'):
+        local.load_prepared(pp)

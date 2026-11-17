@@ -1,0 +1,38 @@
+# Copy to a .local.yaml; source sampling config must describe the REVIEWED 65k RAW model.
+# This template cannot authorize training. A real reviewed M0 decision is required.
+name: fold03_mechanics_mse_pair
+source_sampling_config: configs/sample_mechanics_s0.local.yaml
+historical_hparams: configs/fold03_raw50k_hparams.yaml
+output_root: 08_训练与生成结果/15_Fold03_力学反馈_运行
+exclude_alloy_id: 3
+expected_source_step: 5000
+expected_effective_step: 65000
+expected_source_sha256:
+  raw_unet: 872ed5cb88d0648a72118b1bf6da432732f6167610619ecb4c1140168b0fdd7a
+  condition_encoder_weights: 0483a621f1214d2df8bea83e67019d194000bc5533b7d5cd8c413599a9327cad
+training:
+  seed: 20261031
+  additional_steps: 5000
+  learning_rate: 3.0e-5
+  warmup_steps: 250
+  save_every: 1000
+  log_every: 25
+  deterministic: true
+mechanics:
+  proxy_file: output/mechanics_m0/proxy/proxy_model.json
+  decision_file: output/mechanics_m0/m0_decision.json
+  labels_file: 09_力学试验数据_只读整理_20261029/tables_from_windows/alloy_median_9_mechanics_targets.csv
+  group_size: 4
+  max_decoded_windows: 8
+  calibration_batches: 200
+  gradient_ratio: 0.15
+evaluation:
+  alloy_ids: [5, 7, 14, 15, 19, 20]
+  heldout_alloy_ids: [3]
+  seeds: [20261012, 20261013, 20261014, 20261015, 20261016, 20261017, 20261018, 20261019, 20261020, 20261021, 20261022, 20261023, 20261024, 20261025, 20261026, 20261027, 20261028, 20261029, 20261030, 20261031]
+  height: 256
+  width: 256
+  steps: 50
+  guidance_scale: 1.8
+  gb_threshold: 0.18
+  sampling_dtype: float16

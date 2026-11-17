@@ -1,0 +1,143 @@
+# Euler+GB，从零训练。旧 RGB 配置不读这个文件。
+# 4080 SUPER 32GB 上，256 窗口的 RGB 预设是 VAE batch 24、扩散 batch 32。
+# 这里 VAE 用 batch 16、学习率 2e-4、10000 步：7 通道比 3 通道占得多，16 给首跑留余量。
+# 10000 步大约是留一折里 21 张图的 60 遍。每 2000 步存一次；重建损失还在降，再从检查点往后续。
+# 扩散两种宽度共用 batch 16、累积 2（有效 32）、学习率 1e-4、50000 步。
+# 50000 是从零训练的原预算，不是后来续训到 60k/65k 的长度。
+# 下面 32 个采样种子所有模型共用。没有按测试图挑种子的入口。
+# 训练随机种子 seed 与采样种子不是一回事。宽网络和窄网络用同一个训练种子。
+seed: 20261117
+output_root: 08_训练与生成结果/euler_gb/fold14_narrow
+
+data:
+  image_mode: euler_gb
+  manifest: /Users/masaharu/Desktop/1.材料开发/data/data/manifest.json
+  compositions: data/compositions.csv
+  heat_treatment: data/heat_treatment.csv
+  exclude_alloy_id: 14
+  patch_size: 256
+  patches_per_image: 128
+  crop_margins: [0, 0, 0, 0]
+  horizontal_flip: false
+  vertical_flip: false
+  rotate_180: false
+  num_workers: 4
+
+composition:
+  candidate_features: [Ni, Fe, Cr, Nb, Ta, Co, Mo, Al, Ti]
+  closure_drop_feature: Fe
+  min_nonzero_samples: 2
+  min_standard_deviation: 1.0e-8
+  vicinal_jitter_std: 0.05
+  max_normalized_extrapolation: 3.0
+
+euler_gb:
+  phi1_degrees: 360
+  Phi_degrees: 90
+  phi2_degrees: 90
+  phi_encoding: sincos
+  boundary_threshold: 15
+  boundary_max_half_width: 2
+  boundary_min_component: 8
+  boundary_max_local_fraction: 0.45
+  boundary_local_radius: 3
+  boundary_euler: fill_neighbors
+  gb_loss: bce
+  orientation_l1_weight: 1.0
+  gb_loss_weight: 1.0
+  gb_edge_weight: 0.20
+vae:
+  in_channels: 7
+  out_channels: 7
+  latent_channels: 4
+  block_out_channels: [64, 128, 256]
+  layers_per_block: 2
+  kl_weight: 1.0e-6
+  edge_weight: 0.20
+
+diffusion:
+  block_out_channels: [64, 128, 128]
+  layers_per_block: 2
+  condition_hidden_dim: 128
+  condition_dropout: 0.15
+  num_train_timesteps: 1000
+  beta_schedule: squaredcos_cap_v2
+  prediction_type: epsilon
+  ema_decay: 0.9999
+
+train_vae:
+  output_dir: 08_训练与生成结果/euler_gb/fold14_narrow/vae
+  batch_size: 16
+  gradient_accumulation_steps: 1
+  learning_rate: 2.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  max_steps: 10000
+  mixed_precision: fp16
+  gradient_checkpointing: false
+  save_every: 2000
+  log_every: 25
+
+train_diffusion:
+  output_dir: 08_训练与生成结果/euler_gb/fold14_narrow/diffusion
+  vae_dir: 08_训练与生成结果/euler_gb/fold14_narrow/vae/final
+  batch_size: 16
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 1000
+  max_steps: 50000
+  mixed_precision: fp16
+  gradient_checkpointing: true
+  vae_encode_batch_size: 4
+  lambda_gb: 0.0
+  lambda_edge: 0.0
+  save_every: 5000
+  sample_every: 5000
+  log_every: 25
+
+evaluation:
+  focus_alloy_ids: [13, 12, 5]
+  grain_threshold_degrees: 15
+  copy_stride: 32
+
+sampling:
+  num_inference_steps: 50
+  guidance_scale: 1.8
+  height: 256
+  width: 256
+  crop_height: 256
+  crop_width: 256
+  seeds:
+    - 2026111701
+    - 2026111702
+    - 2026111703
+    - 2026111704
+    - 2026111705
+    - 2026111706
+    - 2026111707
+    - 2026111708
+    - 2026111709
+    - 2026111710
+    - 2026111711
+    - 2026111712
+    - 2026111713
+    - 2026111714
+    - 2026111715
+    - 2026111716
+    - 2026111717
+    - 2026111718
+    - 2026111719
+    - 2026111720
+    - 2026111721
+    - 2026111722
+    - 2026111723
+    - 2026111724
+    - 2026111725
+    - 2026111726
+    - 2026111727
+    - 2026111728
+    - 2026111729
+    - 2026111730
+    - 2026111731
+    - 2026111732
